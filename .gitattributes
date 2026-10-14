@@ -1,0 +1,6 @@
+# Нативные ядра — бинарные; если подключите Git LFS, раскомментируйте:
+# *.so  filter=lfs diff=lfs merge=lfs -text
+# *.aar filter=lfs diff=lfs merge=lfs -text
+*.so  binary
+*.aar binary
+*.srs binary

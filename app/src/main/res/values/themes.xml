@@ -1,0 +1,8 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Базовая тема. UI рисуется в Compose (ZenTheme), эта нужна для splash/окна. -->
+    <style name="Theme.ZenBlaster" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">#050508</item>
+        <item name="android:navigationBarColor">#050508</item>
+        <item name="android:windowBackground">#050508</item>
+    </style>
+</resources>

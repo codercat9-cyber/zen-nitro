@@ -1,0 +1,57 @@
+# ZEN NITRO
+
+Антицензурный VPN-клиент для Android: обход ТСПУ/DPI, белых списков и
+блокировок по адресу. Kotlin + Jetpack Compose + VpnService, три ядра в
+отдельных процессах.
+
+> Репозиторий пока закрытый. Лицензия не выбрана — все права у автора.
+
+## Ядра
+
+| Ядро | Что поднимает | Где живёт |
+|---|---|---|
+| **sing-box** (libbox.aar) | VLESS Reality/Vision/gRPC/WS, Hysteria2 (+Salamander), TUIC, Trojan, Shadowsocks, VMess; TUN, DNS, маршрутизация | процесс приложения |
+| **Xray-core 26.10.10** (`libxrayexec.so`) | XHTTP, mKCP, VLESS Encryption, нарезка ClientHello и шум | отдельный процесс, SOCKS на случайном порту с паролем |
+| **AmneziaWG** (`libwg.so` v3.1 + `libwg1.so` v1.0.4) | WireGuard, AWG 1.0 / 1.5 / 2.0 / 3 | процессы `:awg` / `:awg1` |
+| **ByeDPI** (`libbyedpi.so`) | DPI-щит (десинхронизация TLS), опционально в цепочке | процесс `:dpi` |
+
+Почему отдельные процессы: в одном процессе два рантайма Go дерутся за
+сигналы, а чужой C-код (ByeDPI) при падении уносил бы с собой туннель.
+
+## Что умеет
+
+- Подписки любых форматов (ссылки, base64, JSON sing-box/Xray, шаблоны
+  Happ/Hiddify), сведение повторов, «полки» по подпискам.
+- Каскад: откат на второе ядро, снятие подмены имени, развязка с DPI-щитом,
+  перебор нод с учётом того, что работало **на этом операторе**.
+- Режим белых списков: опрос сети (разрешённое/заграничное), подмена SNI
+  на разрешённый домен для нод с CDN.
+- DNS: шифрованный DoH по IP (без имени в рукопожатии), отдельные резолверы
+  до туннеля и внутри, детекция подмены ответов оператором.
+- Броня: постоянный uTLS-отпечаток устройства, xudp, IPv6 off, пароли на
+  всех внутренних портах (приложения не вычислят VPN через 127.0.0.1).
+- Сторож канала: пинг без мигания, «встряска радио» на слабой сотовой
+  связи, переподъём при залипании ядра на пропавшем интерфейсе.
+- Чёрный ящик: журнал попыток на телефоне (`Android/data/com.zen.nitro/files/`).
+
+## Структура
+
+```
+app/src/main/java/com/zen/blaster/
+  MainActivity.kt          интерфейс (Compose), каскад, подписки
+  vpn/ZenVpnService.kt     VpnService + libbox (sing-box), сторож канала
+  vpn/ZenAwgService.kt     AmneziaWG (основное и запасное ядро)
+  vpn/DpiService.kt        ByeDPI в своём процессе
+  core/ConfigBuilder.kt    конфиг sing-box
+  core/XrayEngine.kt       конфиг и запуск Xray
+  core/AmneziaCore.kt      JNI к libwg, сборка UAPI
+  core/Subscriptions.kt    загрузка/разбор подписок, пинг
+  core/Resolver.kt         DoH-резолвер, физическая сеть
+  core/DnsChoice.kt        список резолверов (проверены по IP-сертификату)
+  core/Blackbox.kt         журнал
+app/src/main/jniLibs/      нативные ядра под arm64-v8a / armeabi-v7a / x86_64
+app/libs/libbox.aar        ядро sing-box
+native/awg/                исходники и рецепт сборки ядер AmneziaWG
+```
+
+Сборка и обновление ядер — в [BUILDING.md](BUILDING.md).

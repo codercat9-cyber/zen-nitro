@@ -1,0 +1,23 @@
+# Сборка
+build/
+app/build/
+.gradle/
+.kotlin/
+*.apk
+*.aab
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Локальное и секретное — НИКОГДА в git
+local.properties
+keystore.properties
+*.jks
+*.keystore
+google-services.json
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.DS_Store

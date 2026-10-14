@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Иконка плитки в шторке: щит с молнией. Одноцветная и без заливки фона —
+     система сама красит её по состоянию плитки. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24"
+    android:tint="?android:attr/colorControlNormal">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12,1L3,5v6c0,5.55 3.84,10.74 9,12 5.16,-1.26 9,-6.45 9,-12V5L12,1zM12,3.18l7,3.11V11c0,4.52 -2.98,8.69 -7,9.93C7.98,19.69 5,15.52 5,11V6.29L12,3.18z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M13,6l-4,6.5h2.6L10.6,18l4.4,-7h-2.8L13,6z" />
+</vector>

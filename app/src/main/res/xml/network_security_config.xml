@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 9+ запрещает HTTP по умолчанию, из-за чего блокировались запросы
+  к локальному API ядра (127.0.0.1:9095) — статистика и пинг не работали.
+  Разрешаем cleartext ТОЛЬКО для localhost, наружу всё остаётся закрытым.
+-->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+    <base-config cleartextTrafficPermitted="false" />
+</network-security-config>
