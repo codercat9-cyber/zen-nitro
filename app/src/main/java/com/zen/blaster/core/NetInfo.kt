@@ -89,9 +89,32 @@ object NetInfo {
     //  подряд набегали за полминуты — и туннель рвался сам, на ровном месте.
     //  Отсюда четырнадцать записей «сорвалась» за один день живых тестов,
     //  и все до единой — на мобильной сети.
+    //
+    //  ПЕРВЫЕ СЕКУНДЫ НОВОЙ СЕТИ ОЦЕНКЕ НЕ ВЕРИМ. Сразу после смены сети
+    //  (симка, Wi-Fi → сотовая) система ещё ничего не намерила и отдаёт
+    //  заглушку: 6 сентября 2026 это было 14 Кбит/с на живом LTE. Ровно в
+    //  этот момент и случается переподключение — Hysteria2 уходила с Brutal
+    //  на BBR, а таймауты растягивались вчетверо, будто мы на EDGE. Пока
+    //  сеть моложе FRESH_MS, честно говорим «не знаю» (0).
+    //
+    //  И спрашиваем ФИЗИЧЕСКУЮ сеть: при поднятом туннеле activeNetwork —
+    //  это сам VPN, и оценка бралась у него.
+    private const val FRESH_MS = 15_000L
+    @Volatile private var seenNet = ""
+    @Volatile private var seenAt = 0L
+    private val bornAt = android.os.SystemClock.elapsedRealtime()
+
     fun downKbps(ctx: Context): Int = try {
         val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        cm.getNetworkCapabilities(cm.activeNetwork)?.linkDownstreamBandwidthKbps ?: 0
+        val net = Resolver.physical() ?: cm.activeNetwork
+        val now = android.os.SystemClock.elapsedRealtime()
+        val key = net?.toString().orEmpty()
+        // Первую увиденную сеть считаем давней: при запуске приложения она
+        // обычно поднята давно, а «не знаю» на EDGE стоило бы Brutal в узком
+        // канале. Молодой считаем только ту, что сменилась у нас на глазах.
+        if (key != seenNet) { seenAt = if (seenNet.isEmpty()) 0L else now; seenNet = key }
+        if (seenAt > 0 && now - seenAt < FRESH_MS && now - bornAt > FRESH_MS) 0
+        else cm.getNetworkCapabilities(net)?.linkDownstreamBandwidthKbps ?: 0
     } catch (_: Throwable) { 0 }
 
     // Мобильный канал заведомо медленного поколения. Порог в два мегабита
