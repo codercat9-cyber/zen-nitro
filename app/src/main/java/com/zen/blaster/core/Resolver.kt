@@ -56,9 +56,14 @@ object Resolver {
     private val FALLBACK = listOf(
         "https://9.9.9.9/dns-query",            // Quad9
         "https://94.140.14.14/dns-query",       // AdGuard
-        "https://194.242.2.2/dns-query",        // Mullvad
-        "https://76.76.2.0/dns-query",          // ControlD
-        "https://193.110.81.0/dns-query",       // dns0.eu
+        // Mullvad, ControlD по 76.76.2.0 и dns0.eu здесь стояли до 3.5 и
+        // были мертвы: у первых двух сертификат не на этот адрес, dns0 закрыт.
+        // Каждый мёртвый в очереди — лишний таймаут при подъёме. Замена —
+        // из проверки 14.10.2026 (см. DnsChoice).
+        "https://185.222.222.222/dns-query",    // DNS.SB
+        "https://76.76.2.11/p0",                // ControlD
+        "https://130.59.31.248/dns-query",      // Switch
+        "https://149.112.112.112/dns-query",    // Quad9, второй адрес
         "https://77.88.8.8/dns-query",          // Яндекс — жив внутри РФ
         "https://1.1.1.1/dns-query",
         "https://8.8.8.8/dns-query",
