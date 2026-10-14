@@ -19,7 +19,9 @@ class CloudflareTest {
     }
 
     @Test fun fingerprints() {
-        for (fp in listOf("chrome", "randomized", "random", "", null)) assertTrue("$fp", Cloudflare.risky(fp))
-        for (fp in listOf("firefox", "edge", "safari", "ios", "android", "Firefox")) assertFalse(fp, Cloudflare.risky(fp))
+        // firefox и safari в Xray 26.10 уже с постквантовым ключом.
+        for (fp in listOf("chrome", "firefox", "safari", "randomized", "random", "", null))
+            assertTrue("$fp", Cloudflare.risky(fp))
+        for (fp in listOf("android", "edge", "ios", "Android")) assertFalse(fp, Cloudflare.risky(fp))
     }
 }

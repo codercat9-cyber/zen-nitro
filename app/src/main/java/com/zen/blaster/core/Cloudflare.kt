@@ -13,26 +13,36 @@ import java.net.InetAddress
 //
 //  Проверено 14.10.2026 с проводного канала в РФ, мимо всех туннелей,
 //  VLESS+WS+TLS на настоящие адреса:
-//    • Cloudflare 104.16.x / 162.159.x: chrome, randomized, Go-по-умолчанию —
-//      глухо; firefox, edge, safari, ios, android — Cloudflare отвечает;
+//    • Cloudflare 104.16.x / 162.159.x, sing-box 1.14: chrome, randomized,
+//      Go-по-умолчанию — глухо; firefox, edge, safari, ios, android —
+//      Cloudflare отвечает;
+//    • то же, Xray 26.10: chrome, firefox, safari — глухо (у его uTLS
+//      Firefox 148 и Safari 26.3 уже с постквантовым ключом); android,
+//      edge, ios — проходят;
 //    • Google, Hetzner, Яндекс: chrome проходит;
 //    • Hetzner с SNI www.cloudflare.com — chrome проходит: ловят по
 //      АДРЕСУ назначения, а не по имени.
 //
 //  Значит, Reality на своих VPS это не трогает, а ноды за CDN Cloudflare
 //  (WS/gRPC/XHTTP через CDN, белосписочные с подменой имени) с отпечатком
-//  chrome не поднимутся никогда. Для таких нод берём firefox: его
-//  приветствие без постквантового ключа и проходит.
+//  chrome не поднимутся никогда. В 3.4 так глохли ноды через Xray (его
+//  chrome — Chrome 133 с ключом); sing-box 1.11 слал Chrome 120 без ключа
+//  и проходил — а переезд на 1.14 принёс бы ту же беду и ему.
+//
+//  Для нод за Cloudflare берём «android» — приветствие OkHttp: без
+//  постквантового ключа в обоих ядрах и самое обычное для телефона —
+//  так к Cloudflare ходит половина приложений на Android.
 // ============================================================================
 object Cloudflare {
 
     // Отпечаток для нод за Cloudflare.
-    const val SAFE_FP = "firefox"
+    const val SAFE_FP = "android"
 
-    // Отпечатки без постквантового ключа (проверены выше). Всё остальное —
-    // chrome, randomized, random (может выпасть chrome), пустой (голый Go)
-    // — под подозрением.
-    private val SAFE = setOf("firefox", "edge", "safari", "ios", "android")
+    // Отпечатки без постквантового ключа В ОБОИХ ядрах (проверены выше).
+    // Всё остальное — chrome, firefox и safari (в Xray уже с ключом),
+    // randomized, random (может выпасть chrome), пустой (голый Go) — под
+    // подозрением.
+    private val SAFE = setOf("android", "edge", "ios")
 
     fun risky(fp: String?): Boolean = fp.isNullOrEmpty() || fp.lowercase() !in SAFE
 
