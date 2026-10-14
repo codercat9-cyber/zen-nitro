@@ -19,24 +19,45 @@ APK по архитектурам — в `app/build/outputs/apk/release/`.
 
 ## Ядро sing-box (`app/libs/libbox.aar`)
 
-Сейчас в проекте **sing-box 1.11**. Конфиг генерируется в старом формате DNS
-(`address`, без `type`/`server`) — ядро 1.12+ его не примет. Переезд на
-1.14 требует переписать DNS-часть ConfigBuilder и перейти на CommandServer
-в ZenVpnService.
+В проекте **sing-box 1.14.3**. Запуск — через `CommandServer` (см.
+`vpn/BoxCore.kt`), конфиг — в формате 1.14 (`core/ConfigBuilder.kt`);
+сохранённые конфиги старого вида переводит `core/SingBoxCompat.kt`.
+
+Собираем не штатным `build_libbox`, а напрямую `gomobile bind`: штатный
+тянет naive-выход (cronet), которому нужен NDK новее 25-го, а Zen он не
+нужен. Заодно выкинуты Tailscale/OpenVPN/OpenConnect/USBIP и лишняя ABI x86.
 
 ```bash
-git clone --branch v1.14.3 https://github.com/SagerNet/sing-box && cd sing-box
-go install github.com/sagernet/gomobile/cmd/gomobile@v0.1.12 \
-           github.com/sagernet/gomobile/cmd/gobind@v0.1.12
-gomobile init
-JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 \
-ANDROID_NDK_HOME=$HOME/Android/Sdk/ndk/25.1.8937393 \
-go run ./cmd/internal/build_libbox -target android
-cp libbox.aar ../zen-nitro/app/libs/
+native/sbox/build.sh
 ```
+
+Скрипт сам скачает sing-box 1.14.3, наложит `native/sbox/zen-noshell.patch`
+(отключает удалённую консоль — она одна тянула Tailscale, 210 пакетов),
+соберёт `app/libs/libbox.aar` и `build/sing-box-check` для проверки конфигов.
 
 Контракт `PlatformInterface` сверять через
 `javap -cp classes.jar io.nekohasekai.libbox.PlatformInterface`.
+
+### Проверка конфигов без телефона
+
+```bash
+tools/check-configs.sh          # бинарник берёт из build/sing-box-check
+```
+
+Тест `ConfigMatrixTest` собирает конфиги всех протоколов и режимов (плюс
+старый сохранённый конфиг 3.4), скрипт прогоняет каждый через `sing-box
+check` той же версии. После любой правки ConfigBuilder — обязательно.
+
+### Стенд жизненного цикла ядра
+
+`native/sbox/zenlife/main.go` — то же, что делает `vpn/BoxCore.kt`, но на
+ПК и на настоящем libbox: шесть подъёмов подряд с закрытием прошлого ядра
+в фоне, журнал через клиент команд, запрос через прокси (curl). Режимы:
+`ZL_HANG=1` — прошлое ядро «зависло» и не закрывается; `ZL_UNIQUE=1` —
+свой файл кеша на подъём (как в Zen); `ZL_ALL=1` — один подъём с полным
+журналом. Положить в `sing-box/cmd/zenlife/`, собрать с тегами из
+`native/sbox/build.sh`, запускать с коротким относительным путём базы
+(у unix-сокета предел 108 символов): `./zenlife config.json lb`.
 
 ## Xray (`libxrayexec.so`)
 

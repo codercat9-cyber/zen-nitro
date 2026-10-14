@@ -10,7 +10,7 @@
 
 | Ядро | Что поднимает | Где живёт |
 |---|---|---|
-| **sing-box** (libbox.aar) | VLESS Reality/Vision/gRPC/WS, Hysteria2 (+Salamander), TUIC, Trojan, Shadowsocks, VMess; TUN, DNS, маршрутизация | процесс приложения |
+| **sing-box 1.14.3** (libbox.aar) | VLESS Reality/Vision/gRPC/WS, Hysteria2 (+Salamander), TUIC, Trojan, Shadowsocks, VMess; TUN, DNS, маршрутизация | процесс приложения |
 | **Xray-core 26.10.10** (`libxrayexec.so`) | XHTTP, mKCP, VLESS Encryption, нарезка ClientHello и шум | отдельный процесс, SOCKS на случайном порту с паролем |
 | **AmneziaWG** (`libwg.so` v3.1 + `libwg1.so` v1.0.4) | WireGuard, AWG 1.0 / 1.5 / 2.0 / 3 | процессы `:awg` / `:awg1` |
 | **ByeDPI** (`libbyedpi.so`) | DPI-щит (десинхронизация TLS), опционально в цепочке | процесс `:dpi` |
@@ -40,6 +40,8 @@
 app/src/main/java/com/zen/blaster/
   MainActivity.kt          интерфейс (Compose), каскад, подписки
   vpn/ZenVpnService.kt     VpnService + libbox (sing-box), сторож канала
+  vpn/BoxCore.kt           один запуск ядра: CommandServer + журнал
+  core/SingBoxCompat.kt    перевод конфигов под формат sing-box 1.14
   vpn/ZenAwgService.kt     AmneziaWG (основное и запасное ядро)
   vpn/DpiService.kt        ByeDPI в своём процессе
   core/ConfigBuilder.kt    конфиг sing-box

@@ -1,0 +1,20 @@
+diff --git a/experimental/libbox/native_shell_session.go b/experimental/libbox/native_shell_session.go
+index d9bd5d2..3458b98 100644
+--- a/experimental/libbox/native_shell_session.go
++++ b/experimental/libbox/native_shell_session.go
+@@ -1,4 +1,4 @@
+-//go:build linux || android || darwin || ios
++//go:build (linux || android || darwin || ios) && !zen_noshell
+ 
+ package libbox
+ 
+diff --git a/experimental/libbox/native_shell_session_stub.go b/experimental/libbox/native_shell_session_stub.go
+index 8544efa..b63aca3 100644
+--- a/experimental/libbox/native_shell_session_stub.go
++++ b/experimental/libbox/native_shell_session_stub.go
+@@ -1,4 +1,4 @@
+-//go:build !linux && !android && !darwin && !ios
++//go:build (!linux && !android && !darwin && !ios) || zen_noshell
+ 
+ package libbox
+ 

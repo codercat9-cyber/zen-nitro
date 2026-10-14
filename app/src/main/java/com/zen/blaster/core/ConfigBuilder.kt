@@ -7,9 +7,10 @@ import org.json.JSONObject
 // ============================================================================
 //  Генерация конфига sing-box.
 //
-//  ⚠️ Ядро в APK — sing-box v1.11, поэтому DNS в LEGACY-формате
-//     ({"address": "..."}), БЕЗ "type"/"server" и без default_domain_resolver
-//     (это синтаксис 1.12+, ядро его не понимает → «unknown field type»).
+//  ⚠️ Ядро в APK — sing-box v1.14. DNS-серверы только нового вида
+//     ({"type": "https", "server": …}), без "sniff" во входах и без
+//     "domain_strategy" у выходов: всё это ядро 1.14 отвергает при старте.
+//     Сохранённые конфиги старого вида переводит SingBoxCompat.upgrade.
 //
 //  Три режима (единственный TUN держит sing-box, ByeDPI — только SOCKS):
 //    • только DPI  : TUN → socks(ByeDPI)          IP не меняется
@@ -124,9 +125,8 @@ object ConfigBuilder {
         val rules = JSONArray()
             .put(JSONObject().put("action", "sniff"))
             .put(JSONObject().put("protocol", "dns").put("action", "hijack-dns"))
-        // ВНИМАНИЕ: `tls_fragment` наше ядро (libbox из sing-box v1.11.0) НЕ знает —
-        // конфиг отвергается с "unknown field". Фрагментацию TLS обеспечивает
-        // ByeDPI (DPI-щит), поэтому здесь её не дублируем.
+        // Фрагментацию TLS обеспечивает ByeDPI (DPI-щит), поэтому
+        // здесь её не дублируем.
             .put(JSONObject().put("ip_is_private", true).put("outbound", "direct"))
         // РАНЬШЕ РУ-домены уходили мимо туннеля ВСЕГДА, даже с выключенной
         // гео-маршрутизацией — из-за этого сайты видели настоящий IP и страну.
@@ -159,9 +159,13 @@ object ConfigBuilder {
             .put("rules", rules)
             .put("final", finalTag)
             .put("auto_detect_interface", true)
+            // Чем ядро разрешает имена для прямых выходов. В 1.14 без этого
+            // поля конфиг с несколькими DNS-серверами не стартует.
+            .put("default_domain_resolver", JSONObject()
+                .put("server", SingBoxCompat.BOOT).put("strategy", ds))
         if (ruleSet.length() > 0) route.put("rule_set", ruleSet)
 
-        // ---- DNS (LEGACY-формат для ядра 1.11) ----
+        // ---- DNS ----
         // DNS НИКОГДА не гоним через ByeDPI: он десинхронизирует TLS и ломает
         // само DoH-соединение → getaddrinfo падает, ничего не грузится.
         // В режиме «только DPI» резолвим напрямую.
@@ -197,31 +201,28 @@ object ConfigBuilder {
         if (geoRouting)
             dnsRules.put(JSONObject().put("domain_suffix", JSONArray(RU)).put("server", "ru-dns"))
 
+        val servers = JSONArray()
+            .put(SingBoxCompat.dnsServer("remote-dns", mainDns, dnsDetour))
+            // Раньше здесь стоял обычный UDP-резолвер (77.88.8.8) мимо
+            // туннеля: оператор читал ВСЕ такие запросы открытым текстом,
+            // включая имя VPN-сервера, а резолвер видел настоящий IP и
+            // страну. Теперь даже прямой резолв идёт по DoH.
+            // Мимо туннеля — только живучий резолвер. Здесь тоже стоял
+            // адрес для туннеля, и при «Авто» имя самого VPN-сервера
+            // разрешалось прямым DoH к Cloudflare.
+            .put(SingBoxCompat.dnsServer(SingBoxCompat.BOOT, directDohUrl, null))
+            // Если человек выбрал системный резолвер — значит у него в этот
+            // день режут DoH, и Яндекс по DoH тоже может не пройти. Тогда
+            // и российские имена спрашиваем у оператора: свои сайты он не
+            // блокирует, а ответит быстро и с российскими узлами CDN.
+            .put(SingBoxCompat.dnsServer("ru-dns",
+                if (directDohUrl == "local") "local" else RU_DNS, null))
+        if (SingBoxCompat.needsSys(servers))
+            servers.put(JSONObject().put("tag", SingBoxCompat.SYS).put("type", "local"))
         val dns = JSONObject()
-            .put("servers", JSONArray()
-                .put(JSONObject().put("tag", "remote-dns")
-                    .put("address", mainDns)
-                    .put("detour", dnsDetour).put("strategy", ds))
-                // Раньше здесь стоял обычный UDP-резолвер (77.88.8.8) мимо
-                // туннеля: оператор читал ВСЕ такие запросы открытым текстом,
-                // включая имя VPN-сервера, а резолвер видел настоящий IP и
-                // страну. Теперь даже прямой резолв идёт по DoH.
-                // Мимо туннеля — только живучий резолвер. Здесь тоже стоял
-                // адрес для туннеля, и при «Авто» имя самого VPN-сервера
-                // разрешалось прямым DoH к Cloudflare.
-                .put(JSONObject().put("tag", "boot-dns")
-                    .put("address", directDohUrl)
-                    .put("detour", "direct").put("strategy", ds))
-                // Если человек выбрал системный резолвер — значит у него в этот
-                // день режут DoH, и Яндекс по DoH тоже может не пройти. Тогда
-                // и российские имена спрашиваем у оператора: свои сайты он не
-                // блокирует, а ответит быстро и с российскими узлами CDN.
-                .put(JSONObject().put("tag", "ru-dns")
-                    .put("address", if (directDohUrl == "local") "local" else RU_DNS)
-                    .put("detour", "direct").put("strategy", ds)))
+            .put("servers", servers)
             .put("rules", dnsRules)
             .put("final", "remote-dns")
-            .put("independent_cache", true)
             .put("strategy", ds)
 
         // ---- TUN ----
@@ -292,7 +293,6 @@ object ConfigBuilder {
             .put("type", "mixed").put("tag", "mixed-in")
             .put("listen", if (proxyMode && !lanProxy) "127.0.0.1" else "0.0.0.0")
             .put("listen_port", Prefs.PROXY_PORT)
-            .put("sniff", true)
         // Открытый прокси на 0.0.0.0 — это открытый ретранслятор: в общей
         // сети им воспользуется кто угодно, и наружу это будет выглядеть как
         // наш трафик. Поэтому пароль, а не «ну ладно».
@@ -318,8 +318,7 @@ object ConfigBuilder {
         inbounds.put(JSONObject()
             .put("type", "mixed").put("tag", "probe-in")
             .put("listen", "127.0.0.1")
-            .put("listen_port", LocalProbe.port)
-            .put("sniff", true))
+            .put("listen_port", LocalProbe.port))
 
         return JSONObject()
             .put("log", JSONObject().put("level", "info").put("timestamp", true))
@@ -388,7 +387,10 @@ object ConfigBuilder {
         val isUdp = n.type == "Hysteria2" || n.type == "TUIC"
         if (chainViaDpi && !isUdp && !n.wl) out.put("detour", "dpi-socks")
         // В аварийном режиме только IPv4: по IPv6 такие сети обычно не пускают.
-        out.put("domain_strategy", if (n.wl) "ipv4_only" else ds)
+        // Имя сервера обычно приходит уже адресом (ZenVpnService.preresolve),
+        // резолвер — на случай, когда заранее разрешить не вышло.
+        out.put("domain_resolver", JSONObject().put("server", SingBoxCompat.BOOT)
+            .put("strategy", if (n.wl) "ipv4_only" else ds))
 
         when (n.type) {
             // VLESS и VMess разбираются ОДНОЙ веткой намеренно: у них общий

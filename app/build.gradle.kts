@@ -17,8 +17,8 @@ android {
         applicationId = "com.zen.nitro"
         minSdk = 24                 // Android 7.0 (VpnService + современные протоколы)
         targetSdk = 34
-        versionCode = 25
-        versionName = "3.4"
+        versionCode = 26
+        versionName = "3.5"
         // Ядро sing-box (libbox.aar) — нативные .so под эти ABI.
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
     }
@@ -95,6 +95,9 @@ android {
     // buildConfig нужен, чтобы код знал СВОЁ имя пакета: оно участвует
     // в исключении приложения из туннеля и не должно быть строкой.
     buildFeatures { compose = true; buildConfig = true }
+    // Тесты конфигов идут на обычной JVM: android.jar там из заглушек,
+    // и любой случайный вызов Android вернёт ноль, а не уронит прогон.
+    testOptions { unitTests.isReturnDefaultValues = true }
 }
 
 dependencies {
@@ -115,4 +118,9 @@ dependencies {
     // HTTP для подписок + JSON.
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+
+    // Проверка конфигов sing-box без телефона (см. src/test, tools/check-configs.sh).
+    // org.json настоящий: в android.jar для JVM-тестов он из заглушек.
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }

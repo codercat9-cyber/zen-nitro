@@ -17,12 +17,18 @@ import com.zen.blaster.MainActivity
 import com.zen.blaster.core.ByeDpi
 import com.zen.blaster.core.Stats
 import com.zen.blaster.core.XrayEngine
-import io.nekohasekai.libbox.BoxService
+import io.nekohasekai.libbox.BridgeOptions
+import io.nekohasekai.libbox.BridgeSession
+import io.nekohasekai.libbox.ConnectionOwner
+import io.nekohasekai.libbox.ExchangeContext
 import io.nekohasekai.libbox.InterfaceUpdateListener
 import io.nekohasekai.libbox.Libbox
+import io.nekohasekai.libbox.LocalDNSTransport
+import io.nekohasekai.libbox.NeighborUpdateListener
 import io.nekohasekai.libbox.NetworkInterfaceIterator
 import io.nekohasekai.libbox.PlatformInterface
-import io.nekohasekai.libbox.SetupOptions
+import io.nekohasekai.libbox.PlatformUser
+import io.nekohasekai.libbox.ShellSession
 import io.nekohasekai.libbox.StringIterator
 import io.nekohasekai.libbox.TunOptions
 import io.nekohasekai.libbox.WIFIState
@@ -58,7 +64,7 @@ class ZenVpnService : VpnService(), PlatformInterface {
         var onState: ((Boolean) -> Unit)? = null
     }
 
-    private var boxService: BoxService? = null
+    private var boxService: BoxCore? = null
 
     // ОСТАНОВКА ЯДРА sing-box НЕ ДОЛЖНА ВЕШАТЬ ВЫЗЫВАЮЩИЙ ПОТОК.
     //
@@ -72,10 +78,14 @@ class ZenVpnService : VpnService(), PlatformInterface {
     // Теперь ядро закрывается в своём потоке; ждём его не дольше waitMs
     // (с главного потока — не ждём вовсе). Зависшее ядро бросаем: новый
     // подъём всё равно берёт свободные порты.
-    private fun takeBox(): BoxService? { val b = boxService; boxService = null; return b }
+    private fun takeBox(): BoxCore? { val b = boxService; boxService = null; return b }
 
-    private fun closeBox(b: BoxService?, waitMs: Long) {
+    private fun closeBox(b: BoxCore?, waitMs: Long) {
         b ?: return
+        // Сервер управления закрываем сразу и здесь же: это быстро, а уходящий
+        // сервер удаляет файл своего сокета — пусть сделает это до того, как
+        // следующий запуск заведёт свой (см. BoxCore.detach).
+        b.detach()
         val t = kotlin.concurrent.thread(name = "box-close", isDaemon = true) {
             try { b.close() } catch (_: Throwable) {}
         }
@@ -413,7 +423,10 @@ class ZenVpnService : VpnService(), PlatformInterface {
             // ОСТАТКАМ прежнего. Теперь драться не за что.
             val port = com.zen.blaster.core.ClashApi.claim()
             com.zen.blaster.core.LocalProbe.claim()
-            val cfg = com.zen.blaster.core.ClashApi.retarget(retune(preresolve(config)))
+            // upgrade — первым: конфиг мог быть сохранён прошлой версией под
+            // ядро 1.11 (плитка, always-on), а 1.14 старый вид не примет.
+            val cfg = freshCacheFile(com.zen.blaster.core.ClashApi.retarget(retune(cloudflareSafe(
+                preresolve(com.zen.blaster.core.SingBoxCompat.upgrade(config))))))
             // Сосед по порту — это прошлое ядро, которое ещё закрывается в фоне
             // (см. closeBox). Это нормально и ничему не мешает, а строка в
             // журнале 190 раз за день читалась как «ядро не отпускает порт».
@@ -421,16 +434,20 @@ class ZenVpnService : VpnService(), PlatformInterface {
             // копятся и не закрываются вовсе.
             if (port >= 9095 + 15) say("⚠️ Управляющий порт ядра: $port — прошлые ядра не закрываются")
 
-            val opts = SetupOptions()
-            opts.basePath = filesDir.absolutePath
-            opts.workingPath = File(filesDir, "work").apply { mkdirs() }.absolutePath
-            opts.tempPath = cacheDir.absolutePath
-            Libbox.setup(opts)
-
-            val service = Libbox.newService(cfg, this)
-            service.start()
-            if (!alive(gen)) { try { service.close() } catch (_: Exception) {}; return }
+            BoxCore.setup(filesDir, cacheDir)
+            val service = BoxCore(this) { line ->
+                android.util.Log.i("ZenCore", line)   // дублируем в logcat — видно через adb
+                sayCore(line)
+            }
+            // Держим ссылку ДО старта: если ядро повиснет внутри подъёма,
+            // отключение всё равно найдёт его и закроет.
             boxService = service
+            try { service.start(cfg) } catch (t: Throwable) {
+                if (boxService === service) boxService = null
+                closeBox(service, 0)
+                throw t
+            }
+            if (!alive(gen)) { if (boxService === service) boxService = null; closeBox(service, 0); return }
             running = true
             say("✅ sing-box запущен")
             val tag = if (dpi && !hasVpnOutbound(config)) "dpi-socks" else "proxy"
@@ -579,6 +596,56 @@ class ZenVpnService : VpnService(), PlatformInterface {
             if (ip == server) continue
             o.put("server", ip)
             say("🔎 $server → $ip")
+            changed = true
+        }
+        if (changed) root.toString() else config
+    } catch (_: Throwable) { config }
+
+    // СВОЙ ФАЙЛ КЕША НА КАЖДЫЙ ПОДЪЁМ.
+    //
+    // Ядро всегда открывает базу кеша (cache.db) и запирает её на время
+    // работы. Если прошлое ядро зависло при закрытии (мёртвый канал — см.
+    // closeBox), замок остаётся у него, а новое ждёт его 10 раз по секунде
+    // и падает с «initialize cache-file: timeout». Со стороны — «прошлое
+    // ядро держит, новое не поднимается». На стенде с тем же libbox: при
+    // зависшем прошлом ядре подъём 9,5 с и отказ; с отдельным файлом —
+    // 60 мс. Содержимое кеша нам не нужно (селекторов и FakeIP нет), так
+    // что старые файлы просто удаляем: у зависшего владельца файл живёт,
+    // пока он его держит, а новому ядру он не мешает.
+    private fun freshCacheFile(config: String): String = try {
+        val dir = File(filesDir, "work").apply { mkdirs() }
+        dir.listFiles { f -> f.name.startsWith("cache") && f.name.endsWith(".db") }
+            ?.forEach { it.delete() }
+        val root = org.json.JSONObject(config)
+        val exp = root.optJSONObject("experimental") ?: org.json.JSONObject().also { root.put("experimental", it) }
+        exp.put("cache_file", org.json.JSONObject().put("enabled", true)
+            .put("path", File(dir, "cache-${System.currentTimeMillis()}.db").absolutePath))
+        root.toString()
+    } catch (_: Throwable) { config }
+
+    // Нода за Cloudflare — отпечаток без постквантового ключа.
+    //
+    // Зовётся ПОСЛЕ preresolve: судим по адресу, а он известен только там.
+    // Отпечаток устройства (chrome) к Cloudflare ТСПУ глушит — подробности и
+    // замеры в core/Cloudflare.kt. Reality не трогаем: там отпечаток часть
+    // маскировки, а за Cloudflare Reality не живёт.
+    private fun cloudflareSafe(config: String): String = try {
+        val root = org.json.JSONObject(config)
+        val outs = root.optJSONArray("outbounds") ?: return config
+        var changed = false
+        for (i in 0 until outs.length()) {
+            val o = outs.optJSONObject(i) ?: continue
+            val tls = o.optJSONObject("tls") ?: continue
+            if (!tls.optBoolean("enabled")) continue
+            if (tls.optJSONObject("reality")?.optBoolean("enabled") == true) continue
+            if (!com.zen.blaster.core.Cloudflare.owns(o.optString("server"))) continue
+            val utls = tls.optJSONObject("utls")
+            val fp = if (utls?.optBoolean("enabled") == true) utls.optString("fingerprint") else ""
+            if (!com.zen.blaster.core.Cloudflare.risky(fp)) continue
+            tls.put("utls", org.json.JSONObject().put("enabled", true)
+                .put("fingerprint", com.zen.blaster.core.Cloudflare.SAFE_FP))
+            say("☁️ Нода за Cloudflare — отпечаток ${com.zen.blaster.core.Cloudflare.SAFE_FP} " +
+                "вместо ${fp.ifEmpty { "стандартного" }}: chrome к Cloudflare ТСПУ глушит")
             changed = true
         }
         if (changed) root.toString() else config
@@ -1242,6 +1309,9 @@ class ZenVpnService : VpnService(), PlatformInterface {
     } catch (_: Throwable) { -1 }
 
     // ---------------------------------------------------------- PlatformInterface
+    // Контракт libbox 1.14 (27 методов). Сверка: javap -cp classes.jar
+    // io.nekohasekai.libbox.PlatformInterface. SSH, Tailscale, мосты и
+    // уведомления ядра нам не нужны — честно отказываем.
 
     // Создавался ли TUN в этой сессии (в режиме прокси — нет).
     @Volatile private var tunUsed = false
@@ -1252,23 +1322,24 @@ class ZenVpnService : VpnService(), PlatformInterface {
         b.setSession("ZEN NITRO")
         b.setMtu(options.getMTU())
 
-        val v4 = options.inet4Address
+        val v4 = options.getInet4Address()
         while (v4.hasNext()) { val p = v4.next(); b.addAddress(p.address(), p.prefix()) }
-        val v6 = options.inet6Address
+        val v6 = options.getInet6Address()
         while (v6.hasNext()) { val p = v6.next(); b.addAddress(p.address(), p.prefix()) }
 
-        if (options.autoRoute) {
+        if (options.getAutoRoute()) {
             b.addRoute("0.0.0.0", 0)
             b.addRoute("::", 0)
+            // В 1.14 адресов DNS у туннеля может быть несколько — отдаём все.
             try {
-                val dns = options.getDNSServerAddress().value
-                if (dns.isNotEmpty()) b.addDnsServer(dns)
+                val dns = options.getDNSServerAddress()
+                while (dns.hasNext()) { val d = dns.next(); if (d.isNotEmpty()) b.addDnsServer(d) }
             } catch (_: Exception) {}
         }
 
-        val inc = options.includePackage
+        val inc = options.getIncludePackage()
         while (inc.hasNext()) { try { b.addAllowedApplication(inc.next()) } catch (_: Exception) {} }
-        val exc = options.excludePackage
+        val exc = options.getExcludePackage()
         while (exc.hasNext()) { try { b.addDisallowedApplication(exc.next()) } catch (_: Exception) {} }
 
         b.setBlocking(false)
@@ -1289,24 +1360,89 @@ class ZenVpnService : VpnService(), PlatformInterface {
     override fun underNetworkExtension(): Boolean = false
     override fun includeAllNetworks(): Boolean = false
     override fun clearDNSCache() {}
-    override fun writeLog(message: String?) {
-        message?.let {
-            android.util.Log.i("ZenCore", it)   // дублируем в logcat — видно через adb
-            sayCore(it)
+    override fun sendNotification(notification: io.nekohasekai.libbox.Notification?) {}
+    override fun cancelNotification(identifier: String?, typeID: Int) {}
+    override fun readWIFIState(): WIFIState = WIFIState("", "")
+    override fun registerMyInterface(name: String?) {}
+    override fun startNeighborMonitor(listener: NeighborUpdateListener?) {}
+    override fun closeNeighborMonitor(listener: NeighborUpdateListener?) {}
+    override fun findConnectionOwner(ipProtocol: Int, sourceAddress: String?, sourcePort: Int,
+                                     destinationAddress: String?, destinationPort: Int): ConnectionOwner =
+        throw UnsupportedOperationException("правил по приложениям нет")
+    override fun usePlatformShell(): Boolean = false
+    override fun checkPlatformShell() { throw UnsupportedOperationException("shell") }
+    override fun openShellSession(user: PlatformUser?, command: String?, environ: StringIterator?,
+                                  term: String?, rows: Int, cols: Int): ShellSession =
+        throw UnsupportedOperationException("shell")
+    override fun lookupUser(username: String?): PlatformUser = throw UnsupportedOperationException("ssh")
+    override fun lookupSFTPServer(): String = throw UnsupportedOperationException("ssh")
+    override fun readSystemSSHHostKey(): String = throw UnsupportedOperationException("ssh")
+    override fun tailscaleHostname(): String = ""
+    override fun usePlatformBridge(): Boolean = false
+    override fun createBridge(options: BridgeOptions?): BridgeSession = throw UnsupportedOperationException("bridge")
+
+    // СИСТЕМНЫЙ РЕЗОЛВЕР ДЛЯ ЯДРА («DNS: системный», ru-dns, DoH по имени).
+    //
+    // В 1.11 ядро ходило к резолверу оператора само. В 1.14 «local» на
+    // Android обязано идти через приложение — иначе ядро ищет
+    // /etc/resolv.conf, которого на телефоне нет, и имена не разрешаются.
+    // Спрашиваем ФИЗИЧЕСКУЮ сеть, а не сеть по умолчанию: пока поднят
+    // туннель, сеть по умолчанию для нас — он сам, и запрос ушёл бы по кругу.
+    private val localDns = object : LocalDNSTransport {
+        override fun raw(): Boolean = false
+        override fun exchange(ctx: ExchangeContext?, message: ByteArray?) {
+            throw UnsupportedOperationException("raw")
+        }
+        override fun lookup(ctx: ExchangeContext?, network: String?, domain: String?) {
+            ctx ?: return
+            val name = domain.orEmpty().trimEnd('.')
+            // Физической сети нет — честно «сервер недоступен» (SERVFAIL).
+            // Спросить сеть по умолчанию нельзя: при туннеле это он сам, и
+            // запрос вернулся бы в ядро по кругу.
+            val net = com.zen.blaster.core.Resolver.physical()
+            if (net == null) { ctx.errorCode(2); return }
+            val all = try {
+                net.getAllByName(name)
+            } catch (_: java.net.UnknownHostException) {
+                ctx.errorCode(3)                       // NXDOMAIN
+                return
+            }
+            val want = all.filter {
+                when (network) {
+                    "ip4" -> it is java.net.Inet4Address
+                    "ip6" -> it is java.net.Inet6Address
+                    else -> true
+                }
+            }
+            ctx.success(want.joinToString("\n") { it.hostAddress?.substringBefore('%').orEmpty() })
         }
     }
-    override fun sendNotification(notification: io.nekohasekai.libbox.Notification?) {}
-    override fun readWIFIState(): WIFIState = WIFIState("", "")
-
-    override fun findConnectionOwner(ipProto: Int, srcIp: String?, srcPort: Int, destIp: String?, destPort: Int): Int = -1
-    override fun packageNameByUid(uid: Int): String =
-        try { packageManager.getPackagesForUid(uid)?.firstOrNull() ?: "" } catch (_: Exception) { "" }
-    override fun uidByPackageName(packageName: String?): Int =
-        try { packageManager.getPackageUid(packageName ?: "", 0) } catch (_: Exception) { -1 }
+    override fun localDNSTransport(): LocalDNSTransport = localDns
 
     // Перечисление сетевых интерфейсов для ядра.
     override fun getInterfaces(): NetworkInterfaceIterator {
         val list = ArrayList<io.nekohasekai.libbox.NetworkInterface>()
+        // Что о каждом интерфейсе знает система: тип связи, DNS, платный ли.
+        // Ядро 1.14 этим пользуется при выборе сети и для «local»-DNS.
+        class Meta(val type: Int, val dns: List<String>, val metered: Boolean)
+        val meta = HashMap<String, Meta>()
+        try {
+            @Suppress("DEPRECATION")
+            for (n in cm.allNetworks) {
+                val lp = cm.getLinkProperties(n) ?: continue
+                val name = lp.interfaceName ?: continue
+                val caps = cm.getNetworkCapabilities(n) ?: continue
+                val type = when {
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> Libbox.InterfaceTypeWIFI
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> Libbox.InterfaceTypeCellular
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> Libbox.InterfaceTypeEthernet
+                    else -> Libbox.InterfaceTypeOther
+                }
+                meta[name] = Meta(type,
+                    lp.dnsServers.mapNotNull { it.hostAddress?.substringBefore('%') },
+                    !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED))
+            }
+        } catch (_: Exception) {}
         try {
             for (ni in java.util.Collections.list(java.net.NetworkInterface.getNetworkInterfaces())) {
                 if (!ni.isUp) continue
@@ -1332,7 +1468,10 @@ class ZenVpnService : VpnService(), PlatformInterface {
                 if (ni.isPointToPoint) flags = flags or 0x08  // FlagPointToPoint
                 if (ni.isUp) flags = flags or 0x20            // FlagRunning
                 box.flags = flags
-                box.type = 0
+                val m = meta[ni.name]
+                box.type = m?.type ?: Libbox.InterfaceTypeOther
+                box.setDNSServer(StringList(m?.dns ?: emptyList()))
+                box.metered = m?.metered ?: false
                 list.add(box)
             }
         } catch (_: Exception) {}

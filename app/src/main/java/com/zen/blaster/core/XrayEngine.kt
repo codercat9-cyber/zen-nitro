@@ -133,7 +133,7 @@ object XrayEngine {
         claim()
         return try {
             val cfg = File(ctx.filesDir, "xray_config.json")
-            cfg.writeText(withSocks(retargetDpi(resolveServer(configJson, onLog))))
+            cfg.writeText(withSocks(retargetDpi(cloudflareSafe(resolveServer(configJson, onLog), onLog))))
 
             val pb = ProcessBuilder(bin.absolutePath, "run", "-c", cfg.absolutePath)
                 .directory(ctx.filesDir)
@@ -216,6 +216,25 @@ object XrayEngine {
             else { onLog("🔎 $host → $ip"); vnext.put("address", ip); obj.toString() }
         }
     } catch (t: Throwable) { configJson }
+
+    // Нода за Cloudflare — отпечаток без постквантового ключа (см.
+    // core/Cloudflare.kt). XHTTP через CDN — самый частый такой случай.
+    // Зовётся после resolveServer: судим по адресу. Reality не трогаем.
+    private fun cloudflareSafe(configJson: String, onLog: (String) -> Unit): String = try {
+        val obj = JSONObject(configJson)
+        val out = obj.getJSONArray("outbounds").getJSONObject(0)
+        val addr = out.optJSONObject("settings")?.optJSONArray("vnext")
+            ?.optJSONObject(0)?.optString("address").orEmpty()
+        val tls = out.optJSONObject("streamSettings")?.optJSONObject("tlsSettings")
+        val fp = tls?.optString("fingerprint").orEmpty()
+        if (tls == null || !Cloudflare.owns(addr) || !Cloudflare.risky(fp)) configJson
+        else {
+            tls.put("fingerprint", Cloudflare.SAFE_FP)
+            onLog("☁️ Нода за Cloudflare — отпечаток ${Cloudflare.SAFE_FP} вместо ${fp.ifEmpty { "стандартного" }}: " +
+                "chrome к Cloudflare ТСПУ глушит")
+            obj.toString()
+        }
+    } catch (_: Throwable) { configJson }
 
     // Вход SOCKS в конфиге — на выпавший порт и с паролем.
     private fun withSocks(json: String): String = try {
