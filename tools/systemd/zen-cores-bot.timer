@@ -1,0 +1,10 @@
+[Unit]
+Description=ZEN NITRO: робот модулей ядер раз в сутки
+
+[Timer]
+OnCalendar=*-*-* 04:20
+RandomizedDelaySec=30m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -28,6 +28,9 @@ OUT="$ZEN/build/modules"
 WORK="${WORK:-$HOME/build/zen-modules}"
 NDK="${ANDROID_NDK_HOME:-$HOME/Android/Sdk/ndk/25.1.8937393}/toolchains/llvm/prebuilt/linux-x86_64/bin"
 KEY="${ZEN_CORES_KEY:-$HOME/.zen-nitro-cores.pem}"
+# Набор для сборки AmneziaWG (обёртка + go.mod). Робот подсовывает копию с
+# новой версией amneziawg-go, чтобы не трогать исходники приложения.
+AWG_KIT="${AWG_KIT:-$ZEN/native/awg}"
 ABIS="arm64-v8a:arm64:aarch64-linux-android24 armeabi-v7a:arm:armv7a-linux-androideabi24 x86_64:amd64:x86_64-linux-android24"
 
 # Уровни интерфейса (должны совпадать с CoreModules.API в приложении).
@@ -57,10 +60,11 @@ for A in $ABIS; do
 done
 
 # ---------------------------------------------------------------- AmneziaWG
-AWG_TAG="${2:-$(awk '/amneziawg-go\/v3 /{print $2}' "$ZEN/native/awg/zenwg-main/go.mod")}"
-LEG_TAG="$(awk '/amneziawg-go /{print $2}' "$ZEN/native/awg/zenwg-legacy/go.mod")"
+AWG_TAG="${2:-$(awk '/amneziawg-go\/v3 /{print $2}' "$AWG_KIT/zenwg-main/go.mod")}"
+LEG_TAG="$(awk '/amneziawg-go /{print $2}' "$AWG_KIT/zenwg-legacy/go.mod")"
 echo "== AmneziaWG $AWG_TAG (+ запасное $LEG_TAG)"
-OUT="$WORK/awg-out" "$ZEN/native/awg/build.sh" >/dev/null
+rm -rf "$WORK/awg-out"
+OUT="$WORK/awg-out" "$AWG_KIT/build.sh" >/dev/null
 for A in $ABIS; do
   IFS=: read ABI _ _ <<<"$A"
   cp "$WORK/awg-out/$ABI/libwg.so"  "$OUT/awg-$AWG_TAG-$ABI.so"

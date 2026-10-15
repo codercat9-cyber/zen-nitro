@@ -119,6 +119,37 @@ class ConfigMatrixTest {
         for ((name, cfg) in special) { assertModern(name, cfg); save(name, cfg) }
     }
 
+    // Конфиги Xray — всё, что идёт через XrayEngine. Их проверяет настоящий
+    // Xray той же версии (tools/check-configs.sh, `xray run -test`): так
+    // новое ядро ловится на машине, если оно перестало понимать наши поля
+    // (как Xray 26 выкинул allowInsecure и ронял весь конфиг).
+    @Test fun xrayConfigs() {
+        val dir = File(out, "xray").apply { mkdirs() }
+        val x = listOf(
+            Node("VLESS", "xhttp-tls", "203.0.113.20", 443, uuid = uuid, transport = "xhttp",
+                path = "/x", host = "cdn.example.com", sni = "cdn.example.com", mode = "auto"),
+            Node("VLESS", "xhttp-packet-up", "203.0.113.21", 443, uuid = uuid, transport = "xhttp",
+                path = "/x", host = "cdn.example.com", sni = "cdn.example.com", mode = "packet-up",
+                extra = "{\"xPaddingBytes\":\"100-1000\",\"xmux\":{\"maxConcurrency\":\"16-32\"}}"),
+            Node("VLESS", "xhttp-reality", "203.0.113.22", 443, uuid = uuid, transport = "xhttp",
+                path = "/x", sni = "www.microsoft.com", pbk = pbk, sid = "ab12", security = "reality"),
+            Node("VLESS", "kcp", "203.0.113.23", 4443, uuid = uuid, transport = "kcp",
+                seed = "s33d", headerType = "wechat-video", security = "none"),
+            Node("VLESS", "ws-insecure", "203.0.113.24", 443, uuid = uuid, transport = "ws",
+                path = "/ws", host = "h.example.com", sni = "h.example.com", insecure = true),
+            Node("VLESS", "wl-xhttp", "203.0.113.25", 443, uuid = uuid, transport = "xhttp",
+                path = "/", host = "wl.example.com", sni = "wl.example.com").apply { wl = true },
+        )
+        for (n in x) {
+            for ((mode, cfg) in mapOf(
+                "plain" to XrayEngine.buildConfig(n, armor = false, fp = ""),
+                "armor" to XrayEngine.buildConfig(n, armor = true, fp = "chrome"),
+                "front" to XrayEngine.buildConfig(n, armor = true, fp = "chrome", frontDomain = "vk.com"),
+                "dpi" to XrayEngine.buildConfig(n, armor = true, fp = "chrome", viaDpi = true),
+            )) File(dir, "${n.name}--$mode.json").writeText(cfg.toString(2))
+        }
+    }
+
     // Конфиг, сохранённый версией 3.4 под ядро 1.11: так он лежит в
     // prefs.lastConfig у всех, кто обновится, и его поднимают плитка и
     // always-on. После перевода ядро 1.14 обязано его принять.

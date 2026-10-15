@@ -23,4 +23,16 @@ for f in "$dir"/*.json; do
   else bad=$((bad+1)); echo "✗ $(basename "$f"): $out" | head -3; fi
 done
 echo "sing-box $("$SB" version 2>/dev/null | head -1 | awk '{print $3}'): принято $ok, отвергнуто $bad"
-[ $bad -eq 0 ]
+
+# Xray — если есть бинарник для ПК той же версии (XRAY или build/xray-check).
+XR=${XRAY:-build/xray-check}
+xbad=0
+if [ -x "$XR" ]; then
+  xok=0
+  for f in "$dir"/xray/*.json; do
+    if out=$("$XR" run -test -c "$f" 2>&1); then xok=$((xok+1))
+    else xbad=$((xbad+1)); echo "✗ xray/$(basename "$f"): $(echo "$out" | tail -2)" | head -3; fi
+  done
+  echo "Xray $("$XR" version 2>/dev/null | head -1 | awk '{print $2}'): принято $xok, отвергнуто $xbad"
+fi
+[ $bad -eq 0 ] && [ $xbad -eq 0 ]

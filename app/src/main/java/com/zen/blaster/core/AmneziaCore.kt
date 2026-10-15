@@ -62,7 +62,10 @@ object AmneziaCore {
     }
 
     // Что за ядро в работе — для журнала и экрана.
-    fun label(): String = if (loadedPath != null) "${moduleVersion ?: "?"} (модуль)"
+    // До загрузки показываем то, что БУДЕТ загружено (шапка попытки в журнале
+    // пишется раньше, чем библиотека попадает в процесс).
+    fun label(): String = if (loadedPath != null || (!loaded && modulePath != null))
+                              "${moduleVersion ?: "?"} (модуль)"
                           else if (legacy) BUILD_LEGACY else BUILD
 
     // Почему ядро не поднялось — его собственными словами («IpcSet: …»).
