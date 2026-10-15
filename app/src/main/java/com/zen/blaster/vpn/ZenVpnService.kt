@@ -396,7 +396,9 @@ class ZenVpnService : VpnService(), PlatformInterface {
             // Отдельный процесс, потому что два gomobile-рантайма в одном не живут.
             xrayConfig?.let { cfg ->
                 Stats.stage.value = "Поднимаю ядро Xray…"
-                say("🚀 Ядро Xray ${XrayEngine.version(this)} — поднимаю…")
+                say("🚀 Ядро Xray ${XrayEngine.version(this)}" +
+                    (if (com.zen.blaster.core.CoreModules.active(this, com.zen.blaster.core.CoreModules.XRAY) != null)
+                        " (модуль)" else "") + " — поднимаю…")
                 if (!XrayEngine.start(this, cfg) { msg -> sayCore(msg) }) {
                     if (!alive(gen)) return
                     // Без Xray нода просто не заработает — честно падаем, а не

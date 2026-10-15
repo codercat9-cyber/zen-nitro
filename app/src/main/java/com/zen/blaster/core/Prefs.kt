@@ -126,6 +126,13 @@ class Prefs(context: Context) {
         get() = sp.getString("lastXray", "") ?: ""
         set(v) = sp.edit().putString("lastXray", v).apply()
 
+    // Второй источник модулей ядер (кроме нашего сервера) — например,
+    // релизы на GitHub: https://github.com/<кто>/zen-cores/releases/latest/download/
+    // Подпись проверяется та же, так что чужой источник модуль не подсунет.
+    var coresSource: String
+        get() = sp.getString("coresSource", "") ?: ""
+        set(v) = sp.edit().putString("coresSource", v.trim()).apply()
+
     // Профиль AmneziaWG последней сессии (для always-on без запуска UI).
     var lastAwg: String
         get() = sp.getString("lastAwg", "") ?: ""

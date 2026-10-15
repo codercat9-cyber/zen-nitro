@@ -29,6 +29,8 @@ open class ZenAwgService : VpnService() {
 
     // Какое ядро у этого процесса. Переопределяет запасная служба.
     protected open val legacyCore = false
+    private val slot get() = if (legacyCore) com.zen.blaster.core.CoreModules.AWG_LEGACY
+                             else com.zen.blaster.core.CoreModules.AWG
 
     companion object {
         const val ACTION_START = "com.zen.blaster.AWG_START"
@@ -64,6 +66,12 @@ open class ZenAwgService : VpnService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         AmneziaCore.legacy = legacyCore
+        // Модуль ядра, если поставлен (см. CoreModules). Задаём до первой
+        // загрузки библиотеки в этом процессе.
+        com.zen.blaster.core.CoreModules.active(this, slot).let {
+            AmneziaCore.modulePath = it?.path
+            AmneziaCore.moduleVersion = it?.version
+        }
         com.zen.blaster.core.Blackbox.initRemote(this)
         // Физическая сеть (для встряски радио и выбора сокета) ищется через
         // Resolver — в этом процессе его тоже надо привязать к контексту,
@@ -97,8 +105,8 @@ open class ZenAwgService : VpnService() {
             }
             val p = AwgProfile.fromJson(JSONObject(json))
             profile = p
-            val coreName = if (legacyCore) "запасное ${AmneziaCore.BUILD_LEGACY} (AWG 1.x)"
-                           else AmneziaCore.BUILD
+            val coreName = if (legacyCore) "запасное ${AmneziaCore.label()} (AWG 1.x)"
+                           else AmneziaCore.label()
             // Сеанс в журнале — как у sing-box и Xray. Раньше попытки Amnezia
             // в журнал не попадали вовсе: 14 октября 2026 от пяти провалов
             // осталось пять одинаковых строк «сервер не ответил» без единой
@@ -115,7 +123,14 @@ open class ZenAwgService : VpnService() {
                     (if (p.raw.isEmpty()) " · профиль из старой версии (без исходника)" else "")
             ))
             say(stage = "Поднимаю ядро ${p.badge()}…",
-                log = "🚀 Ядро AmneziaWG ${AmneziaCore.version()} · ${p.badge()}")
+                log = "🚀 Ядро AmneziaWG ${AmneziaCore.version()} · ${p.badge()}" +
+                    (if (AmneziaCore.loadedPath != null) " · модуль" else ""))
+            // Модуль был задан, но не загрузился — работаем на встроенном и
+            // засчитываем отказ модулю (после трёх подряд он выключится).
+            if (AmneziaCore.modulePath != null && AmneziaCore.loadedPath == null) {
+                say(log = "⚠️ Модуль ядра не загрузился (${AmneziaCore.moduleError.take(120)}) — работаю на встроенном")
+                com.zen.blaster.core.CoreModules.report(this, slot, false, "не загрузился: ${AmneziaCore.moduleError.take(80)}")
+            }
 
             // Имя сервера разрешаем сами: внутри Go-ядра системного резолвера
             // может не оказаться, а системный DNS оператор ещё и подменяет.
@@ -159,6 +174,9 @@ open class ZenAwgService : VpnService() {
                 // Причину говорит само ядро: «invalid UAPI device key: …»,
                 // «S1 must be more then 12 to use headerProtection» и т.п.
                 val why = AmneziaCore.lastError().ifEmpty { "без объяснений" }
+                if (AmneziaCore.loadedPath != null &&
+                    com.zen.blaster.core.CoreModules.report(this, slot, false, "не принял конфиг: ${why.take(80)}"))
+                    say(log = "↩️ Модуль ядра трижды не принял конфиг — выключен, дальше встроенное")
                 fail("ядро AmneziaWG не приняло конфиг: $why")
                 return
             }
@@ -177,6 +195,7 @@ open class ZenAwgService : VpnService() {
                 return
             }
             com.zen.blaster.core.Blackbox.outcome(true, "рукопожатие прошло")
+            if (AmneziaCore.loadedPath != null) com.zen.blaster.core.CoreModules.report(this, slot, true)
             if (legacyCore) com.zen.blaster.core.Prefs(this).awgLegacyRunning = true
             say(connected = true, stage = "")
             startStats()
@@ -413,7 +432,10 @@ open class ZenAwgService : VpnService() {
         stopSelf()
         // Запасное ядро нужно редко, а рантайм Go держит ~120 МБ памяти и
         // после остановки: процесс :awg1 так и висел в фоне. Гасим его сами.
-        if (legacyCore) android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(
+        // Тот же приём, если сменили модуль ядра: библиотека уже сидит в этом
+        // процессе, и подменить её можно только новым процессом.
+        val stale = AmneziaCore.loadedPath != com.zen.blaster.core.CoreModules.active(this, slot)?.path
+        if (legacyCore || stale) android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(
             { android.os.Process.killProcess(android.os.Process.myPid()) }, 1500)
     }
 

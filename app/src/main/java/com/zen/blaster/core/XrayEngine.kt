@@ -61,7 +61,9 @@ object XrayEngine {
             try {
                 if (android.system.Os.stat("/proc/$pid").st_uid != me) continue
                 val cmd = java.io.File(d, "cmdline").readText()
-                if (!cmd.contains("libxrayexec.so")) continue
+                // Встроенный — по имени файла, модуль — по своей папке
+                // (у него в командной строке первым стоит загрузчик).
+                if (!cmd.contains("libxrayexec.so") && !cmd.contains("/cores/xray/")) continue
                 android.os.Process.killProcess(pid)
                 n++
             } catch (_: Throwable) {}
@@ -113,10 +115,30 @@ object XrayEngine {
 
     private fun binary(ctx: Context) = File(ctx.applicationInfo.nativeLibraryDir, "libxrayexec.so")
 
-    fun available(ctx: Context): Boolean = binary(ctx).canExecute()
+    // МОДУЛЬ XRAY (CoreModules): файл в папке приложения. Запустить его
+    // напрямую Android 10+ не даст — запускаем системный загрузчик и отдаём
+    // файл ему (загрузчик грузит его как библиотеку, это разрешено). Модуль
+    // собран под Android (PIE), встроенный — как раньше, из nativeLibraryDir.
+    private val LINKER = if (android.os.Process.is64Bit()) "/system/bin/linker64" else "/system/bin/linker"
+
+    // Команда запуска: модуль через загрузчик либо встроенный бинарник.
+    // Второе — модуль ли это (для отчёта CoreModules).
+    private fun command(ctx: Context): Pair<List<String>, Boolean> {
+        val m = CoreModules.active(ctx, CoreModules.XRAY)
+        if (m != null && !forceBuiltin) return listOf(LINKER, m.path) to true
+        return listOf(binary(ctx).absolutePath) to false
+    }
+
+    // На этот запуск — только встроенный (модуль только что не поднялся).
+    @Volatile private var forceBuiltin = false
+
+    @Volatile var moduleInUse = false; private set
+
+    fun available(ctx: Context): Boolean =
+        binary(ctx).canExecute() || CoreModules.active(ctx, CoreModules.XRAY) != null
 
     fun version(ctx: Context): String = try {
-        val p = ProcessBuilder(binary(ctx).absolutePath, "version").redirectErrorStream(true).start()
+        val p = ProcessBuilder(command(ctx).first + "version").redirectErrorStream(true).start()
         val out = p.inputStream.bufferedReader().readText()
         p.waitFor()
         Regex("Xray ([0-9.]+)").find(out)?.groupValues?.get(1) ?: "?"
@@ -125,17 +147,33 @@ object XrayEngine {
     // Поднимает Xray с готовым конфигом (JSON-строка). Возвращает true, если
     // процесс жив и SOCKS реально принимает соединения.
     fun start(ctx: Context, configJson: String, onLog: (String) -> Unit): Boolean {
+        val ok = startOnce(ctx, configJson, onLog)
+        if (!moduleInUse) return ok
+        if (ok) { CoreModules.report(ctx, CoreModules.XRAY, true); return true }
+        // Модуль не поднялся сам по себе (процесс умер, SOCKS не открылся) —
+        // засчитываем ему отказ и тут же пробуем встроенным ядром: человек
+        // не должен остаться без ноды из-за свежего модуля.
+        val why = lastError
+        val off = CoreModules.report(ctx, CoreModules.XRAY, false, why.take(80))
+        onLog("⚠️ Модуль Xray не поднялся ($why) — запускаю встроенное ядро" +
+            (if (off) " · модуль выключен после трёх отказов" else ""))
+        forceBuiltin = true
+        return try { startOnce(ctx, configJson, onLog) } finally { forceBuiltin = false }
+    }
+
+    private fun startOnce(ctx: Context, configJson: String, onLog: (String) -> Unit): Boolean {
         stop()
         val orphans = reapOrphans()
         if (orphans > 0) onLog("♻️ Погасил брошенный Xray от прошлого запуска ($orphans)")
-        val bin = binary(ctx)
-        if (!bin.canExecute()) { lastError = "бинарник Xray не найден/не исполняемый"; return false }
+        val (cmd, fromModule) = command(ctx)
+        moduleInUse = fromModule
+        if (!fromModule && !binary(ctx).canExecute()) { lastError = "бинарник Xray не найден/не исполняемый"; return false }
         claim()
         return try {
             val cfg = File(ctx.filesDir, "xray_config.json")
             cfg.writeText(withSocks(retargetDpi(cloudflareSafe(resolveServer(configJson, onLog), onLog))))
 
-            val pb = ProcessBuilder(bin.absolutePath, "run", "-c", cfg.absolutePath)
+            val pb = ProcessBuilder(cmd + listOf("run", "-c", cfg.absolutePath))
                 .directory(ctx.filesDir)
                 .redirectErrorStream(true)
             pb.environment()["XRAY_LOCATION_ASSET"] = ctx.filesDir.absolutePath

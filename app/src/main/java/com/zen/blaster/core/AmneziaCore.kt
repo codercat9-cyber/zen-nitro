@@ -38,11 +38,32 @@ object AmneziaCore {
 
     val running: Boolean get() = handle >= 0
 
+    // Модуль ядра вместо встроенной библиотеки (CoreModules). Ставит служба
+    // ДО первого вызова. Библиотека грузится в процесс один раз: сменили
+    // модуль — изменение вступит при следующем запуске процесса :awg.
+    @Volatile var modulePath: String? = null
+    @Volatile var moduleVersion: String? = null
+    // Откуда ядро загружено на самом деле: путь модуля или null — встроенное.
+    @Volatile var loadedPath: String? = null; private set
+    // Почему модуль не загрузился (тогда работает встроенное ядро).
+    @Volatile var moduleError: String = ""; private set
+
     private fun load(): Boolean {
         if (loaded) return true
+        modulePath?.let { p ->
+            try { System.load(p); loaded = true; loadedPath = p; return true }
+            catch (t: Throwable) {
+                moduleError = t.message ?: t.javaClass.simpleName
+                android.util.Log.e("ZenAwg", "module load: $moduleError")
+            }
+        }
         return try { System.loadLibrary(if (legacy) "wg1" else "wg"); loaded = true; true }
         catch (t: Throwable) { android.util.Log.e("ZenAwg", "loadLibrary: ${t.message}"); false }
     }
+
+    // Что за ядро в работе — для журнала и экрана.
+    fun label(): String = if (loadedPath != null) "${moduleVersion ?: "?"} (модуль)"
+                          else if (legacy) BUILD_LEGACY else BUILD
 
     // Почему ядро не поднялось — его собственными словами («IpcSet: …»).
     fun lastError(): String = if (!load()) "ядро не загрузилось" else

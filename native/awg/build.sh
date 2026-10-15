@@ -17,7 +17,9 @@
 # =============================================================================
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-APP="$HERE/../../app/src/main/jniLibs"
+# OUT — куда класть (по умолчанию прямо в jniLibs приложения; сборщик
+# модулей ядер задаёт свою папку, см. native/modules/build.sh).
+APP="${OUT:-$HERE/../../app/src/main/jniLibs}"
 GOVER="${GOVER:-1.25.12}"
 NDK="${NDK:-$HOME/Android/Sdk/ndk/25.1.8937393}/toolchains/llvm/prebuilt/linux-x86_64/bin"
 WORK="${WORK:-${TMPDIR:-/tmp}/zen-awg-build}"
@@ -39,6 +41,7 @@ for pair in main:libwg legacy:libwg1; do
   cd "$HERE/zenwg-$V"
   for A in arm64-v8a:arm64:aarch64-linux-android21 armeabi-v7a:arm:armv7a-linux-androideabi21 x86_64:amd64:x86_64-linux-android21; do
     IFS=: read ABI GA CC <<<"$A"
+    mkdir -p "$APP/$ABI"
     GOOS=android GOARCH=$GA GOARM=7 CGO_ENABLED=1 CC="$NDK/$CC-clang" \
     CGO_LDFLAGS="-Wl,-soname=$LIB.so -Wl,--build-id=none" \
     go build -tags linux -ldflags="-s -w -buildid=" -trimpath -buildvcs=false \

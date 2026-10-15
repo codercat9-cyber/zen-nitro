@@ -3931,19 +3931,154 @@ class MainActivity : ComponentActivity() {
                 "скачивается, установку подтверждаете вы. Молчаливой подмены сборки в " +
                 "антицензурном клиенте быть не должно — это готовый канал для подсовывания " +
                 "чужого кода.\n\n" +
-                "Ядра Xray и sing-box лежат ВНУТРИ приложения: Android не исполняет " +
-                "скачанный после установки код, поэтому ядра приезжают только вместе с " +
-                "новым APK. Отдельно и молча обновляются лишь гео-правила — это списки " +
-                "доменов, а не код.\n\n" +
+                "Ядро sing-box приезжает только вместе с новым APK. Xray и Amnezia можно " +
+                "обновлять отдельно — подписанными модулями, раздел «Ядра» ниже. Молча " +
+                "обновляются лишь гео-правила — это списки доменов, а не код.\n\n" +
                 "Ключ подписи тот же, что и у стоящей версии, — обновление ложится " +
                 "поверх, серверы и настройки остаются на месте.",
                 color = ZenGray, fontSize = 11.sp, modifier = Modifier.padding(top = 6.dp)
             )
 
+            CoresSection()
+
             Spacer(Modifier.height(20.dp))
             Text("ℹ️ Обход DPI на Android обеспечивают сами протоколы (Reality/Hysteria2+Salamander/Gecko). " +
                 "tpws/nfqws на Android недоступны.", color = ZenGray, fontSize = 11.sp)
         }
+    }
+
+    // ---------- ЯДРА (модули) ----------
+    //
+    // Xray и Amnezia обновляются без нового Zen: подписанные модули с нашего
+    // сервера или второго источника (GitHub). Подробности — CoreModules.kt.
+    @Composable
+    private fun CoresSection() {
+        val ctx = this@MainActivity
+        val cm = com.zen.blaster.core.CoreModules
+        var builtinXray by remember { mutableStateOf("…") }
+        var tick by remember { mutableStateOf(0) }            // перерисовать после установки
+        var status by remember { mutableStateOf("") }
+        var busy by remember { mutableStateOf(false) }
+        var offers by remember { mutableStateOf<List<com.zen.blaster.core.CoreModules.Module>>(emptyList()) }
+        var catalog by remember { mutableStateOf<com.zen.blaster.core.CoreModules.Catalog?>(null) }
+        androidx.compose.runtime.LaunchedEffect(Unit) {
+            builtinXray = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                // Версия ВСТРОЕННОГО Xray — сам бинарник из APK.
+                try {
+                    val bin = java.io.File(applicationInfo.nativeLibraryDir, "libxrayexec.so")
+                    val out = ProcessBuilder(bin.absolutePath, "version").redirectErrorStream(true)
+                        .start().inputStream.bufferedReader().readText()
+                    Regex("Xray ([0-9.]+)").find(out)?.groupValues?.get(1) ?: "?"
+                } catch (_: Throwable) { "?" }
+            }
+        }
+        fun line(name: String, slot: String, builtin: String): String {
+            val a = cm.active(ctx, slot)
+            return "$name: встроенное $builtin" + (a?.let { " · модуль ${it.version} — в работе" } ?: "")
+        }
+        // Модуль поставлен или снят — процесс Amnezia, если туннеля в нём нет,
+        // перезапускаем, чтобы он подхватил другое ядро (библиотека грузится
+        // в процесс один раз).
+        fun recycleAwg(slot: String) {
+            if (slot != cm.XRAY && !(prefs.awgRunning || prefs.awgLegacyRunning)) ZenAwgService.stopAll(ctx)
+        }
+
+        Spacer(Modifier.height(22.dp))
+        Text("ЯДРА", color = ZenRed, fontWeight = FontWeight.Bold)
+        key(tick) {
+            Text(
+                line("Xray", cm.XRAY, builtinXray) + "\n" +
+                line("Amnezia", cm.AWG, com.zen.blaster.core.AmneziaCore.BUILD) + "\n" +
+                line("Amnezia, запасное (AWG 1.x)", cm.AWG_LEGACY, com.zen.blaster.core.AmneziaCore.BUILD_LEGACY) + "\n" +
+                "sing-box: ${io.nekohasekai.libbox.Libbox.version()} — только с новой версией Zen",
+                color = ZenGray, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp))
+        }
+        Button(
+            onClick = {
+                if (busy) return@Button
+                busy = true; status = "Проверяю…"
+                lifecycleScope.launch {
+                    val cat = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        cm.fetch(ctx) { m -> runOnUiThread { log(m) } }
+                    }
+                    busy = false
+                    catalog = cat
+                    if (cat == null) { status = "Источники модулей не ответили или подпись не сошлась"; offers = emptyList(); return@launch }
+                    // Предлагаем то, что новее стоящего сейчас (модуля или встроенного).
+                    val now = mapOf(
+                        cm.XRAY to (cm.active(ctx, cm.XRAY)?.version ?: builtinXray),
+                        cm.AWG to (cm.active(ctx, cm.AWG)?.version ?: com.zen.blaster.core.AmneziaCore.BUILD),
+                        cm.AWG_LEGACY to (cm.active(ctx, cm.AWG_LEGACY)?.version ?: com.zen.blaster.core.AmneziaCore.BUILD_LEGACY))
+                    offers = cat.modules.filter { m -> cm.newer(m.version, now[m.slot] ?: "") }
+                        .groupBy { it.slot }.mapNotNull { (_, l) -> l.maxWithOrNull { a, b -> if (cm.newer(a.version, b.version)) 1 else -1 } }
+                    status = if (offers.isEmpty()) "Новее того, что стоит, ничего нет (${cat.modules.size} модулей под ${cm.abi()})"
+                             else "Есть обновления: ${offers.size}"
+                    log("🧩 Модули ядер: $status")
+                }
+            },
+            colors = ButtonDefaults.buttonColors(containerColor = ZenCard),
+            modifier = Modifier.fillMaxWidth().padding(top = 6.dp)
+        ) { Text(if (busy) "…" else "ПРОВЕРИТЬ ОБНОВЛЕНИЯ ЯДЕР", color = Color.White, fontSize = 13.sp) }
+        if (status.isNotEmpty()) Text(status, color = ZenGray, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp))
+
+        for (m in offers) {
+            Button(
+                onClick = {
+                    val cat = catalog ?: return@Button
+                    if (busy) return@Button
+                    busy = true; status = "Ставлю ${m.core} ${m.version}…"
+                    lifecycleScope.launch {
+                        val err = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { cm.install(ctx, cat, m) }
+                        busy = false
+                        status = if (err == null) "Поставлен ${m.core} ${m.version} — заработает при следующем подключении"
+                                 else "Не поставился: $err"
+                        log("🧩 $status")
+                        if (err == null) { offers = offers - m; recycleAwg(m.slot); tick++ }
+                    }
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = ZenCard),
+                modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+            ) {
+                Text("ПОСТАВИТЬ ${if (m.slot == cm.XRAY) "XRAY" else if (m.slot == cm.AWG) "AMNEZIA" else "AMNEZIA 1.x"} ${m.version}" +
+                    " (${m.size / 1048576} МБ)", color = Color.White, fontSize = 13.sp)
+            }
+            if (m.notes.isNotEmpty()) Text(m.notes, color = ZenGray, fontSize = 11.sp)
+        }
+
+        key(tick) {
+            for ((slot, name) in listOf(cm.XRAY to "XRAY", cm.AWG to "AMNEZIA", cm.AWG_LEGACY to "AMNEZIA 1.x")) {
+                val a = cm.active(ctx, slot) ?: continue
+                Button(
+                    onClick = {
+                        cm.revert(ctx, slot, "вернули вручную")
+                        log("↩️ $name: модуль ${a.version} снят — дальше встроенное ядро")
+                        recycleAwg(slot); tick++
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = ZenCard),
+                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+                ) { Text("ВЕРНУТЬ ВСТРОЕННОЕ: $name", color = Color.White, fontSize = 13.sp) }
+            }
+        }
+
+        var src by remember { mutableStateOf(prefs.coresSource) }
+        OutlinedTextField(
+            value = src,
+            onValueChange = { src = it; prefs.coresSource = it },
+            placeholder = { Text("второй источник, напр. https://github.com/…/releases/latest/download/",
+                color = ZenGray, fontSize = 12.sp) },
+            textStyle = androidx.compose.ui.text.TextStyle(color = Color.White, fontSize = 12.sp),
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = ZenCyan, unfocusedBorderColor = ZenDivider, cursorColor = ZenCyan),
+            maxLines = 2,
+            modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+        )
+        Text(
+            "Модуль — свежая сборка ядра под ваш телефон. Ставится только с нашей подписью: " +
+            "чужой или повреждённый файл не примется, откуда бы он ни пришёл. Встроенные ядра " +
+            "остаются внутри приложения: если модуль трижды не поднимется сам, Zen вернётся " +
+            "на встроенное и напишет об этом в журнал.",
+            color = ZenGray, fontSize = 11.sp, modifier = Modifier.padding(top = 6.dp)
+        )
     }
 
     @Composable

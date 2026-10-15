@@ -91,3 +91,36 @@ ABI прямо в `jniLibs`. Версии ядер — в `native/awg/zenwg-*/go
 
 Взят из ByeByeDPI (romanvht) как есть, JNI-обёртка
 `io.github.romanvht.byedpi.core.ByeDpiProxy`.
+
+## Модули ядер (обновление Xray и AmneziaWG без нового APK)
+
+Xray и AmneziaWG можно обновлять у людей отдельно от приложения: Zen качает
+**подписанный** модуль под свою архитектуру и грузит его вместо встроенного
+ядра (`core/CoreModules.kt`, экран «Настройки → Ядра»). sing-box модулем не
+обновляется: его Java-интерфейс меняется между версиями.
+
+- **AmneziaWG** — та же библиотека с нашей JNI-обёрткой, грузится
+  `System.load()` в процессе `:awg`.
+- **Xray** — собран под Android (`GOOS=android`, PIE). Скачанный файл
+  Android 10+ напрямую не исполняет, поэтому Zen запускает
+  `/system/bin/linker64 <модуль> run -c …`.
+- **Подпись** — ECDSA P-256 над `cores.json` (в нём размер и sha256 каждого
+  файла). Открытый ключ зашит в `CoreModules.PUBLIC_KEY`, закрытый —
+  `~/.zen-nitro-cores.pem` на машине сборки (в git не кладётся). Сменили
+  ключ — нужна новая сборка Zen.
+- **Страховка** — встроенные ядра остаются в APK; модуль, трижды не
+  поднявшийся по своей вине, Zen выключает сам.
+
+```bash
+native/modules/build.sh [тег Xray] [версия amneziawg-go]   # → build/modules/
+../storage-messenger/tools/publish-cores.sh                # → наш сервер, /updates/zen/cores/
+```
+
+Уровни интерфейса модулей (`api`) и минимальная сборка Zen (`minApp`)
+пишутся в манифест; Zen не возьмёт модуль, который ему не по силам.
+
+**Робот** — `.github/workflows/cores.yml`: раз в сутки сверяет версии с
+апстримом, собирает и выкладывает модули в релиз `cores` этого репозитория
+(нужен секрет `ZEN_CORES_KEY` — содержимое `~/.zen-nitro-cores.pem`). Для
+людей адрес вписывается в Zen вторым источником:
+`https://github.com/<владелец>/<репозиторий>/releases/download/cores/`.

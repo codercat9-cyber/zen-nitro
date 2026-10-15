@@ -1,0 +1,90 @@
+# =============================================================================
+#  Робот модулей ядер ZEN NITRO.
+#
+#  Раз в сутки смотрит свежие релизы Xray-core и amneziawg-go. Вышло новое —
+#  собирает модули под три архитектуры (native/modules/build.sh), подписывает
+#  манифест ключом из секрета ZEN_CORES_KEY и выкладывает в релиз с тегом
+#  «cores» этого репозитория. В Zen этот адрес вписывается вторым источником:
+#     https://github.com/<владелец>/<репозиторий>/releases/download/cores/
+#  (работает, когда репозиторий публичный; для закрытого — наш сервер).
+#
+#  Секрет ZEN_CORES_KEY — содержимое ~/.zen-nitro-cores.pem с машины сборки
+#  (Settings → Secrets and variables → Actions → New repository secret).
+#  Без него робот не публикует: неподписанный модуль Zen всё равно не примет.
+# =============================================================================
+name: Модули ядер
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      xray:
+        description: "Тег Xray-core (пусто — последний релиз)"
+        required: false
+      force:
+        description: "Собрать, даже если версии не изменились"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  cores:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Что вышло и что у нас
+        id: need
+        run: |
+          XR="${{ github.event.inputs.xray }}"
+          [ -n "$XR" ] || XR=$(git ls-remote --tags --refs https://github.com/XTLS/Xray-core \
+            | awk -F/ '{print $3}' | grep -E '^v[0-9.]+$' | sort -V | tail -1)
+          AWG=$(git ls-remote --tags --refs https://github.com/amnezia-vpn/amneziawg-go \
+            | awk -F/ '{print $3}' | grep -E '^v3\.' | sort -V | tail -1)
+          echo "xray=$XR" >> "$GITHUB_OUTPUT"; echo "awg=$AWG" >> "$GITHUB_OUTPUT"
+          gh release download cores -p cores.json -O old.json 2>/dev/null || echo '{"modules":[]}' > old.json
+          HAVE=$(python3 -c 'import json;m=json.load(open("old.json"))["modules"];print(" ".join(sorted({x["core"]+":"+x["version"] for x in m})))')
+          WANT="awg:$AWG xray:${XR#v}"
+          echo "есть: $HAVE"; echo "нужно: $WANT"
+          if [ "${{ github.event.inputs.force }}" = "true" ] || ! echo "$HAVE" | grep -q "xray:${XR#v}" \
+             || ! echo "$HAVE" | grep -q "awg:$AWG"; then echo "build=1" >> "$GITHUB_OUTPUT"; fi
+
+      - uses: actions/setup-go@v5
+        if: steps.need.outputs.build == '1'
+        with:
+          go-version: "1.27"
+
+      - uses: nttld/setup-ndk@v1
+        if: steps.need.outputs.build == '1'
+        id: ndk
+        with:
+          ndk-version: r25b
+
+      - name: Сборка и подпись
+        if: steps.need.outputs.build == '1'
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          KEY_PEM: ${{ secrets.ZEN_CORES_KEY }}
+        run: |
+          [ -n "$KEY_PEM" ] || { echo "нет секрета ZEN_CORES_KEY — публиковать нечем"; exit 1; }
+          umask 077; printf '%s\n' "$KEY_PEM" > "$RUNNER_TEMP/cores.pem"
+          # AWG: подтянуть версию из апстрима в go.mod обёртки.
+          (cd native/awg/zenwg-main && go get github.com/amnezia-vpn/amneziawg-go/v3@${{ steps.need.outputs.awg }} && go mod tidy)
+          ZEN_CORES_KEY="$RUNNER_TEMP/cores.pem" WORK="$RUNNER_TEMP/work" \
+            native/modules/build.sh "${{ steps.need.outputs.xray }}" "${{ steps.need.outputs.awg }}"
+          rm -f "$RUNNER_TEMP/cores.pem"
+
+      - name: Выложить в релиз «cores»
+        if: steps.need.outputs.build == '1'
+        run: |
+          gh release view cores >/dev/null 2>&1 || gh release create cores --title "Модули ядер" \
+            --notes "Модули ядер для ZEN NITRO. Ставятся из приложения: Настройки → Ядра." --latest=false
+          # Старые файлы — прочь, новые — внутрь, манифест — последним.
+          for a in $(gh release view cores --json assets -q '.assets[].name'); do gh release delete-asset cores "$a" -y; done
+          gh release upload cores build/modules/xray-* build/modules/awg-* build/modules/awg1-*
+          gh release upload cores build/modules/cores.json.sig build/modules/cores.json
