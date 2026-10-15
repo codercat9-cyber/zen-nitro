@@ -100,6 +100,14 @@ class BoxCore(
         }
     }
 
+    // Сбросить все соединения ядра и переоткрыть подключения выходов
+    // (Hysteria2/TUIC заводят новый QUIC с нового порта). Туннель и TUN
+    // остаются — это не переподъём, а «встряска» самого ядра.
+    fun resetNetwork() {
+        if (detached.get()) return
+        try { server?.resetNetwork() } catch (_: Throwable) {}
+    }
+
     // Быстрая часть закрытия: отключить журнал и сервер управления. Не
     // висит — это просто закрытие сокетов. Делать до подъёма нового ядра:
     // уходящий сервер при закрытии удаляет файл command.sock, и если это
@@ -139,10 +147,17 @@ class BoxCore(
         }
         override fun setDefaultLogLevel(level: Int) {}
         override fun clearLogs() {}
+        // Сервер команд отдаёт ВСЕ уровни, вплоть до trace, — отбирать должен
+        // клиент. В 1.11 ядро само слало только уровень из конфига (info), и
+        // без этого фильтра журнал на телефоне захлёбывался DEBUG/TRACE по
+        // нескольку строк на каждое соединение. Уровни sing-box: panic 0,
+        // fatal 1, error 2, warn 3, info 4, debug 5, trace 6.
         override fun writeLogs(messageList: LogIterator?) {
             val it = messageList ?: return
             while (it.hasNext()) {
-                val m = it.next()?.message ?: continue
+                val e = it.next() ?: continue
+                if (e.level > 4) continue
+                val m = e.message ?: continue
                 try { onLog(m) } catch (_: Throwable) {}
             }
         }

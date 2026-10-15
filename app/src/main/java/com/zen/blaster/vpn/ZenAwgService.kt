@@ -65,6 +65,10 @@ open class ZenAwgService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         AmneziaCore.legacy = legacyCore
         com.zen.blaster.core.Blackbox.initRemote(this)
+        // Физическая сеть (для встряски радио и выбора сокета) ищется через
+        // Resolver — в этом процессе его тоже надо привязать к контексту,
+        // иначе physical() всегда пуст и встряска молча не срабатывает.
+        Resolver.attach(this)
         if (intent?.action == ACTION_STOP) { stop(); return START_NOT_STICKY }
         val prefs = com.zen.blaster.core.Prefs(this)
         val json = intent?.getStringExtra(EXTRA_PROFILE) ?: prefs.lastAwg
@@ -84,6 +88,8 @@ open class ZenAwgService : VpnService() {
             // два живых устройства AWG, и старое продолжало слать пакеты.
             if (AmneziaCore.running || tunFd != null) {
                 statsRunning = false
+                unwatchNetwork()
+                com.zen.blaster.core.RadioKeeper.stop()
                 AmneziaCore.down()
                 try { tunFd?.close() } catch (_: Exception) {}
                 tunFd = null
@@ -243,6 +249,23 @@ open class ZenAwgService : VpnService() {
 
     @Volatile private var lastPing = -1
 
+    // СТОРОЖ КАНАЛА AMNEZIA.
+    //
+    // 15.10.2026 канал Amnezia шесть раз молчал от полуминуты до пяти с
+    // половиной минут — и не только при обрыве сети: в 09:08 сессия данных
+    // жила, а туннель молчал четыре с половиной минуты и потом сам ожил.
+    // Почерк фильтра, который держится за конкретный UDP-поток (адрес и
+    // порт): новый поток он пропускает. Сторож при этом только писал «не
+    // отвечает» и ждал.
+    //
+    // Теперь по ступеням, пока канал молчит и байты не идут:
+    //   1-й провал  — встряска радио (модем мог уснуть или съехать на EDGE);
+    //   2-й         — новый исходный порт: для оператора это новый поток;
+    //   дальше      — новый порт раз в ~минуту тишины.
+    // Полного переподъёма здесь нет сознательно: на плохой сети его
+    // рукопожатие может не уложиться в 15 с, и тогда туннель погас бы
+    // совсем — хуже, чем молчание. Само рукопожатие WireGuard повторяет
+    // каждые 5 с, пока есть что слать, — ему нужен только живой путь.
     private fun startPing() {
         Thread({
             var misses = 0
@@ -254,13 +277,23 @@ open class ZenAwgService : VpnService() {
                 com.zen.blaster.core.Stats.feedPing(ms)
                 say(ping = ms)
                 if (ms > 0) {
-                    if (misses >= 3) say(log = "✅ Канал Amnezia снова отвечает: $ms мс")
+                    if (misses >= 2) say(log = "✅ Канал Amnezia снова отвечает: $ms мс")
                     misses = 0
-                } else if (++misses == 3) {
-                    say(log = "⚠️ Канал Amnezia не отвечает уже ~30 с — сервер молчит или сеть пропала")
-                    com.zen.blaster.core.Blackbox.note(
-                        "⚠️ Amnezia «${profile?.name}»: канал молчит · " +
-                        com.zen.blaster.core.NetInfo.line(this))
+                } else if (rxMovingRecently()) {
+                    // Замер не прошёл, а байты из туннеля идут — канал жив,
+                    // просто служебный запрос встал в очередь на узком канале.
+                    misses = 0
+                } else {
+                    misses++
+                    if (misses == 1) com.zen.blaster.core.RadioKick.kick(this, "Amnezia молчит") { say(log = it) }
+                    if (misses == 2 || (misses > 2 && (misses - 2) % 3 == 0))
+                        renewPort("канал молчит ~${misses * 20} с")
+                    if (misses == 3) {
+                        say(log = "⚠️ Канал Amnezia не отвечает уже ~1 мин — сервер молчит или сеть пропала")
+                        com.zen.blaster.core.Blackbox.note(
+                            "⚠️ Amnezia «${profile?.name}»: канал молчит · " +
+                            com.zen.blaster.core.NetInfo.line(this))
+                    }
                 }
                 updateNotif(null)
                 try { Thread.sleep(if (ms > 0) 30_000L else 10_000L) } catch (_: InterruptedException) { break }
@@ -268,17 +301,83 @@ open class ZenAwgService : VpnService() {
         }, "awg-ping").apply { isDaemon = true }.start()
     }
 
+    // Когда из туннеля последний раз пришли байты (пишет поток статистики).
+    @Volatile private var rxAt = 0L
+    private fun rxMovingRecently() =
+        rxAt > 0 && android.os.SystemClock.elapsedRealtime() - rxAt < 20_000L
+
+    // Новый исходный порт — и сразу защитить новые сокеты от собственного
+    // туннеля. Не чаще раза в 15 с: смена сети и сторож могут прийти разом.
+    @Volatile private var renewedAt = 0L
+    @Synchronized private fun renewPort(why: String) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - renewedAt < 15_000L) return
+        renewedAt = now
+        if (!AmneziaCore.rebind()) {
+            say(log = "… сменить порт Amnezia не вышло (${AmneziaCore.lastError().ifEmpty { "старое ядро" }})")
+            return
+        }
+        for (sock in AmneziaCore.sockets()) protect(sock)
+        val msg = "🔀 Amnezia: новый порт — $why"
+        say(log = msg)
+        com.zen.blaster.core.Blackbox.note(msg)
+    }
+
+    // СМЕНА ФИЗИЧЕСКОЙ СЕТИ — СРАЗУ НОВЫЙ ПОРТ.
+    //
+    // За день 15.10 сессия данных пересоздавалась десятки раз: оператор
+    // гасил её сам (NO_GPRS_CONTEXT, EMM_DETACHED), данные переезжали между
+    // симками. Каждый раз сокет ядра оставался старым, и туннель ждал, пока
+    // сторож заметит тишину. Теперь меняем порт в момент смены сети: пакеты
+    // сразу уходят новым путём, а сервер узнаёт новый адрес из первого же.
+    private var netCb: android.net.ConnectivityManager.NetworkCallback? = null
+    private fun watchNetwork() {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+        val cb = object : android.net.ConnectivityManager.NetworkCallback() {
+            @Volatile var current: android.net.Network? = null
+            override fun onAvailable(network: android.net.Network) {
+                val was = current
+                current = network
+                if (was != null && was != network && statsRunning)
+                    kotlin.concurrent.thread(isDaemon = true) { renewPort("сеть сменилась") }
+            }
+        }
+        val req = android.net.NetworkRequest.Builder()
+            .addCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .addCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            .build()
+        try {
+            val h = android.os.Handler(android.os.Looper.getMainLooper())
+            if (Build.VERSION.SDK_INT >= 31) cm.registerBestMatchingNetworkCallback(req, cb, h)
+            else cm.requestNetwork(req, cb, h)
+            netCb = cb
+        } catch (_: Throwable) {}
+    }
+
+    private fun unwatchNetwork() {
+        val cb = netCb ?: return
+        netCb = null
+        try {
+            (getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager)
+                .unregisterNetworkCallback(cb)
+        } catch (_: Throwable) {}
+    }
+
     private fun startStats() {
         if (statsRunning) return
         statsRunning = true
         com.zen.blaster.core.Stats.reset()       // окно «лучшего пинга» — с нуля
+        rxAt = 0L
         startPing()
+        watchNetwork()
+        com.zen.blaster.core.RadioKeeper.start(this) { say(log = it) }
         Thread({
             var pRx = -1L; var pTx = -1L; var pT = 0L
             while (statsRunning) {
                 try {
                     val (rx, tx) = AmneziaCore.traffic()
                     val now = System.currentTimeMillis()
+                    if (pRx in 0 until rx) rxAt = android.os.SystemClock.elapsedRealtime()
                     if (pRx >= 0 && now > pT) {
                         val dt = (now - pT) / 1000.0
                         say(down = (((rx - pRx).coerceAtLeast(0)) / dt).toLong(),
@@ -302,6 +401,8 @@ open class ZenAwgService : VpnService() {
         com.zen.blaster.core.Blackbox.abandon("туннель остановлен")
         if (legacyCore) com.zen.blaster.core.Prefs(this).awgLegacyRunning = false
         statsRunning = false
+        unwatchNetwork()
+        com.zen.blaster.core.RadioKeeper.stop()
         AmneziaCore.down()
         try { tunFd?.close() } catch (_: Exception) {}
         tunFd = null

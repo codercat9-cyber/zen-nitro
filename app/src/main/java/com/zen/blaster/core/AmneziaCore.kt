@@ -72,6 +72,12 @@ object AmneziaCore {
             try { awgGetSocketV6(handle) } catch (_: Throwable) { -1 }
         ).filter { it > 0 }
 
+    // Новый исходный UDP-порт без остановки туннеля (см. awgRebind в
+    // native/awg). Вызывающий ОБЯЗАН сразу защитить новые сокеты (protect),
+    // иначе пакеты ядра завернутся в собственный туннель. false — ядро
+    // старое (без awgRebind) или команду не приняло.
+    fun rebind(): Boolean = handle >= 0 && try { awgRebind(handle) == 0 } catch (_: Throwable) { false }
+
     // Сырой дамп состояния ядра (rx/tx, время хендшейка).
     fun config(): String = if (handle < 0) "" else
         try { awgGetConfig(handle) ?: "" } catch (_: Throwable) { "" }
@@ -154,6 +160,7 @@ object AmneziaCore {
     // --------------------------------------------------------------- нативка
     private external fun awgTurnOn(ifName: String, tunFd: Int, settings: String): Int
     private external fun awgTurnOff(handle: Int)
+    private external fun awgRebind(handle: Int): Int
     private external fun awgGetSocketV4(handle: Int): Int
     private external fun awgGetSocketV6(handle: Int): Int
     private external fun awgGetConfig(handle: Int): String?

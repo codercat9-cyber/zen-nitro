@@ -369,7 +369,7 @@ class MainActivity : ComponentActivity() {
         restoreSelection()
 
         setContent { ZenTheme { HomeScreen() } }
-        loadServers()
+        autoRefreshSubs()
         // Сначала показываем то, что уже знаем с прошлого раза, — кнопка
         // появляется мгновенно. Поход в сеть идёт следом и молча уточняет.
         update.value = com.zen.blaster.core.Updater.cached(this)
@@ -590,6 +590,30 @@ class MainActivity : ComponentActivity() {
         // ложилась бы в файл дважды.
         if (!com.zen.blaster.core.Blackbox.looksLikeCore(msg))
             com.zen.blaster.core.Blackbox.event(msg)
+    }
+
+    // ПОДПИСКИ ПРИ ОТКРЫТИИ — НЕ ПОВЕРХ ПОДЪЁМА ТУННЕЛЯ.
+    //
+    // Открыл приложение и сразу нажал «подключиться» — обычный жест. А
+    // загрузка подписок стартовала в момент открытия, и 15.10.2026 в журнале
+    // она снова и снова шла внутри попытки (+2 с, +7 с от начала): веер
+    // запросов к шести источникам и замер сотни серверов поверх рукопожатия,
+    // на узком канале. Список и так показан из кеша — свежесть подождёт.
+    // На сотовой даём пару секунд на нажатие; если подъём начался, ждём
+    // его исхода (не дольше полутора минут) и ещё немного — пусть канал
+    // разгонится.
+    private fun autoRefreshSubs() {
+        val mobile = com.zen.blaster.core.NetInfo.snapshot(this).mobile
+        lifecycleScope.launch {
+            if (mobile) kotlinx.coroutines.delay(6_000)
+            var waited = 0
+            while (connState.intValue == 1 && waited < 90) { kotlinx.coroutines.delay(1_000); waited++ }
+            if (waited > 0) {
+                log("📥 Подписки обновлю после подключения — не отнимаю канал у рукопожатия")
+                kotlinx.coroutines.delay(5_000)
+            }
+            loadServers()
+        }
     }
 
     private fun loadServers() {

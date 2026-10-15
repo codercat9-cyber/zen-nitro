@@ -10,6 +10,7 @@
 struct go_string { const char *str; long n; };
 extern int awgTurnOn(struct go_string ifname, int tun_fd, struct go_string settings);
 extern void awgTurnOff(int handle);
+extern int awgRebind(int handle);
 extern int awgGetSocketV4(int handle);
 extern int awgGetSocketV6(int handle);
 extern char *awgGetConfig(int handle);
@@ -37,6 +38,11 @@ JNIEXPORT jint JNICALL Java_com_zen_blaster_core_AmneziaCore_awgTurnOn(JNIEnv *e
 JNIEXPORT void JNICALL Java_com_zen_blaster_core_AmneziaCore_awgTurnOff(JNIEnv *env, jclass c, jint handle)
 {
 	awgTurnOff(handle);
+}
+
+JNIEXPORT jint JNICALL Java_com_zen_blaster_core_AmneziaCore_awgRebind(JNIEnv *env, jclass c, jint handle)
+{
+	return awgRebind(handle);
 }
 
 JNIEXPORT jint JNICALL Java_com_zen_blaster_core_AmneziaCore_awgGetSocketV4(JNIEnv *env, jclass c, jint handle)

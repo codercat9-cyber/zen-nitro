@@ -730,6 +730,7 @@ class ZenVpnService : VpnService(), PlatformInterface {
         if (statsRunning) return
         statsRunning = true
         Stats.since.value = System.currentTimeMillis()
+        com.zen.blaster.core.RadioKeeper.start(this) { say(it) }
 
         // Скорость: опрашиваем /connections и считаем дельту.
         // (/traffic в sing-box 1.11 — websocket, обычным чтением не берётся.)
@@ -875,6 +876,21 @@ class ZenVpnService : VpnService(), PlatformInterface {
                         // или сота увела на EDGE, а не сервер умер.
                         if (misses == 2) com.zen.blaster.core.RadioKick.kick(this,
                             "канал молчит") { say(it) }
+                        // МЯГКИЙ СБРОС — между встряской и переподключением.
+                        //
+                        // Раньше после встряски сторож просто ждал до десяти
+                        // промахов (на медленной сети — двадцати), и 15.10
+                        // Hysteria2 на МТС дважды «буксовала» по 9 и 6
+                        // промахов, минуты без связи. Сброс соединений ядра
+                        // дешёвый: туннель остаётся, а QUIC-нода заводит
+                        // новое подключение с нового порта — ровно то, что
+                        // нужно, если оператор зарезал старый поток.
+                        // Вместе со встряской: промах тут — это уже два
+                        // двойных замера и ни байта трафика, около минуты.
+                        if (misses == 2 || misses == 5) {
+                            boxService?.resetNetwork()
+                            say("♻️ Сбросил соединения ядра — канал молчит ($misses промаха подряд)")
+                        }
                         // Сколько промахов терпим, прежде чем поверить в отвал.
                         //
                         // Порог тоже привязан к каналу: на проводе и уверенном
@@ -908,6 +924,7 @@ class ZenVpnService : VpnService(), PlatformInterface {
 
     private fun stopStats() {
         statsRunning = false; Stats.reset()
+        com.zen.blaster.core.RadioKeeper.stop()
         trafficTotal = 0L; trafficAt = 0L
     }
 
@@ -1366,9 +1383,14 @@ class ZenVpnService : VpnService(), PlatformInterface {
     override fun registerMyInterface(name: String?) {}
     override fun startNeighborMonitor(listener: NeighborUpdateListener?) {}
     override fun closeNeighborMonitor(listener: NeighborUpdateListener?) {}
+    // Владельца соединения ядро 1.14 на Android спрашивает у КАЖДОГО
+    // соединения, даже без правил по приложениям. Отказ исключением стоил
+    // строки «failed to search process» в журнале на каждое соединение и
+    // лишнего перехода через JNI. Правил по приложениям у нас нет (раздельное
+    // туннелирование делает сам VpnService) — отвечаем «неизвестен» и всё.
     override fun findConnectionOwner(ipProtocol: Int, sourceAddress: String?, sourcePort: Int,
                                      destinationAddress: String?, destinationPort: Int): ConnectionOwner =
-        throw UnsupportedOperationException("правил по приложениям нет")
+        ConnectionOwner().apply { userId = -1 }
     override fun usePlatformShell(): Boolean = false
     override fun checkPlatformShell() { throw UnsupportedOperationException("shell") }
     override fun openShellSession(user: PlatformUser?, command: String?, environ: StringIterator?,
@@ -1505,8 +1527,10 @@ class ZenVpnService : VpnService(), PlatformInterface {
             override fun onLost(network: Network) {
                 // Сеть ушла — пусть ядро не держится за мёртвый интерфейс.
                 current = ""
+                currentNet = null
                 try { listener.updateDefaultInterface("", -1, false, false) } catch (_: Exception) {}
             }
+            @Volatile var currentNet: Network? = null
             private fun report(network: Network, lp: LinkProperties?) {
                 val name = lp?.interfaceName ?: return
                 if (name.startsWith("tun")) return          // это наш же туннель — не годится
@@ -1514,8 +1538,20 @@ class ZenVpnService : VpnService(), PlatformInterface {
                 if (idx <= 0) return
                 if (name != current && current.isNotEmpty())
                     com.zen.blaster.core.Blackbox.note("🔁 Физическая сеть сменилась: $current → $name — сообщил ядру")
+                // Та же сеть по имени, но НОВАЯ сессия данных. Оператор
+                // пересоздаёт сессию на том же rmnet_dataN с новым адресом
+                // (15.10.2026 — десятки раз за день: NO_GPRS_CONTEXT,
+                // EMM_DETACHED). Ядро видит прежние имя и индекс и соединения
+                // не сбрасывает: Hysteria2 висит на мёртвом QUIC до тайм-аута,
+                // для человека — «лаги» на полминуты и дольше. Сбрасываем сами.
+                val renewed = currentNet != null && currentNet != network && name == current
+                currentNet = network
                 current = name
                 try { listener.updateDefaultInterface(name, idx, false, false) } catch (_: Exception) {}
+                if (renewed) {
+                    boxService?.resetNetwork()
+                    com.zen.blaster.core.Blackbox.note("♻️ Новая сессия данных на $name — сбросил соединения ядра")
+                }
             }
         }
         netCallback = cb

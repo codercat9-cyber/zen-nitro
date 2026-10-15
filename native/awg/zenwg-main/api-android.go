@@ -165,6 +165,24 @@ func awgTurnOff(tunnelHandle int32) {
 	handle.device.Close()
 }
 
+//export awgRebind
+// Новый исходный UDP-порт без остановки туннеля: штатная команда UAPI
+// listen_port=0 закрывает сокеты и открывает их на случайном порту. Для
+// оператора и ТСПУ это новый поток — так туннель выходит из-под режущего
+// фильтра, который держится за старую пятёрку адресов и портов. Новые
+// сокеты Java обязана снова защитить (awgGetSocketV4/V6 → protect).
+func awgRebind(tunnelHandle int32) int32 {
+	handle, ok := tunnelHandles[tunnelHandle]
+	if !ok {
+		return -1
+	}
+	if err := handle.device.IpcSet("listen_port=0\n"); err != nil {
+		lastError = fmt.Sprintf("rebind: %v", err)
+		return -1
+	}
+	return 0
+}
+
 //export awgGetSocketV4
 func awgGetSocketV4(tunnelHandle int32) int32 {
 	handle, ok := tunnelHandles[tunnelHandle]
