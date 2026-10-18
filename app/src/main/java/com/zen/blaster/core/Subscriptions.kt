@@ -47,6 +47,7 @@ object Subscriptions {
         unparsed.clear()
         report.clear()
         val nodes = mutableListOf<Node>()
+        info = ""
         for (s in subs) {
             report += "▪ ${s.name}"
             // Помечаем каждую ноду её подпиской: иначе в общем списке из сотни
@@ -122,7 +123,12 @@ object Subscriptions {
     // полей до нас просто не доезжает, и нода потом не поднимается, хотя
     // сервер жив. Поэтому Happ — последний: он нужен там, где ссылок нет
     // вовсе (так отдаёт, например, Capybara).
+    // СВОЁ ИМЯ — ПЕРВЫМ. С 18.10.2026 у Sirius (subs.bbobr.win, s.creati.men)
+    // есть шаблон под ZEN NITRO: обычные ссылки без шифрования Happ. Кто нас
+    // знает, отдаст по имени лучшее; кто не знает — промолчит, и остальные
+    // имена ниже своё дадут. При совпадении ноды побеждает тот, кто выше.
     private val UNION_AGENTS = listOf(
+        "ZenNitro/${com.zen.blaster.BuildConfig.VERSION_NAME}",
         "Hiddify/2.5.7",
         "v2rayNG/1.9.16",
         "Happ/4.3.0",
@@ -166,6 +172,7 @@ object Subscriptions {
         // свой 429 от панели, своя осечка сети — терять из-за неё всю подписку
         // нельзя, иначе список серверов пропадает на ровном месте.
         if (union.all { it.second == null }) return emptyList()
+        if (info.isNotEmpty()) { report += "   📊 $info"; info = "" }
         val merged = LinkedHashMap<String, Node>()
         val gotFrom = mutableListOf<String>()
         for ((agent, res) in union) {
@@ -185,7 +192,10 @@ object Subscriptions {
             // симптому — это то, чем мы занимались неделями. Показываем ровно
             // столько, чтобы опознать формат: ключи или первые строки. Токен
             // из URL сюда не попадает — это тело ответа, а не адрес.
-            if (part.isEmpty() && res.second.isNotBlank()) {
+            if (part.isEmpty() && lastStub.isNotEmpty()) {
+                report += "   ↳ заглушка панели: $lastStub"
+                lastStub = ""
+            } else if (part.isEmpty() && res.second.isNotBlank()) {
                 val head = res.second.trim().take(110)
                     .replace('\n', '⏎').replace('\r', ' ')
                 report += "   ↳ не разобрано, начало: $head"
@@ -208,6 +218,7 @@ object Subscriptions {
                         // Без этого некоторые панели отдают HTML-страницу
                         // личного кабинета вместо самой подписки.
                         .header("Accept", "*/*")
+                        .device(u)
                         .build()
                 ).execute().use { it.body?.string() ?: "" }
             } catch (e: Exception) {
@@ -242,9 +253,67 @@ object Subscriptions {
             Request.Builder().url(url)
                 .header("User-Agent", agent)
                 .header("Accept", "*/*")
+                .device(url)
                 .build()
-        ).execute().use { it.code to (it.body?.string() ?: "") }
+        ).execute().use { r ->
+            // Что панель говорит о самой подписке — трафик, срок, имя. Берём
+            // из первого ответа, где это есть: у всех имён клиента оно одно.
+            if (info.isEmpty()) userInfo(r.header("subscription-userinfo"), r.header("profile-title"))
+                ?.let { info = it }
+            r.code to (r.body?.string() ?: "")
+        }
     } catch (e: Exception) { null }
+
+    // ЛИМИТ УСТРОЙСТВ (HWID).
+    //
+    // Панели Remnawave с лимитом устройств (Sirius — subs.bbobr.win) без
+    // заголовка x-hwid отдают не ноды, а заглушку из семи «серверов» на
+    // 0.0.0.0: «Приложение не поддерживается… Откройте настройки Happ →
+    // Передавать HWID». Zen 14.10.2026 записывал её в список как семь нод.
+    // Шлём то же, что Happ: идентификатор устройства, ОС, версию, модель.
+    //
+    // Идентификатор постоянный (ANDROID_ID — переустановка Zen не съест новый
+    // слот устройства), но СВОЙ для каждой панели: хеш вместе с адресом
+    // хоста. Разные провайдеры не смогут сопоставить одно устройство.
+    @Volatile var deviceId: String = ""
+
+    private fun hwid(url: String): String {
+        val host = try { java.net.URI(url).host.orEmpty() } catch (_: Exception) { "" }
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+            .digest("zen|$deviceId|$host".toByteArray())
+        return md.take(8).joinToString("") { "%02x".format(it) }
+    }
+
+    private fun Request.Builder.device(url: String): Request.Builder {
+        if (deviceId.isEmpty()) return this
+        return header("x-hwid", hwid(url))
+            .header("x-device-os", "Android")
+            .header("x-ver-os", android.os.Build.VERSION.RELEASE ?: "")
+            .header("x-device-model", android.os.Build.MODEL ?: "")
+    }
+
+    // «upload=0; download=20143; total=5368709120; expire=1797890054» →
+    // «0,0 из 5,0 ГБ · до 23.12.2026». Пусто — панель ничего не сказала.
+    @Volatile var info: String = ""
+    private fun userInfo(raw: String?, title: String?): String? {
+        val parts = raw?.split(';')?.mapNotNull {
+            val kv = it.trim().split('='); if (kv.size == 2) kv[0].trim() to kv[1].trim() else null
+        }?.toMap().orEmpty()
+        val used = (parts["upload"]?.toLongOrNull() ?: 0) + (parts["download"]?.toLongOrNull() ?: 0)
+        val total = parts["total"]?.toLongOrNull() ?: 0
+        val exp = parts["expire"]?.toLongOrNull() ?: 0
+        val name = title?.let {
+            if (it.startsWith("base64:")) try { String(Base64.decode(it.removePrefix("base64:"), Base64.DEFAULT)) }
+                catch (_: Exception) { "" } else it
+        }.orEmpty().trim()
+        val out = mutableListOf<String>()
+        if (name.isNotEmpty()) out += "«$name»"
+        if (total > 0) out += "%.1f из %.1f ГБ".format(used / 1073741824.0, total / 1073741824.0)
+        else if (used > 0) out += "%.1f ГБ".format(used / 1073741824.0)
+        if (exp > 0) out += "до " + java.text.SimpleDateFormat("dd.MM.yyyy", java.util.Locale.US)
+            .format(java.util.Date(exp * 1000))
+        return if (out.isEmpty()) null else out.joinToString(" · ")
+    }
 
     // Что ответила каждая панель на этой загрузке — построчно, для журнала.
     // Именно здесь видно, что happ-шаблон отдал 22 ноды, а hiddify-шаблон 34:
@@ -256,7 +325,7 @@ object Subscriptions {
     @Volatile var lastStub: String = ""
 
     // Разбор тела подписки: голые ссылки, base64 или base64 с переносами.
-    private fun decode(body: String): List<Node> {
+    internal fun decode(body: String): List<Node> {
         // Подписка может отдавать не ссылки, а готовые конфиги Xray в JSON —
         // так делает Capybara. Раньше мы искали в теле «://», не находили и
         // докладывали «ни одного сервера», хотя серверы были.
@@ -312,8 +381,21 @@ object Subscriptions {
         // такую тройную бухгалтерию класть нельзя — счёт потерь должен быть
         // честным.
         synchronized(unparsed) { lost.forEach { if (it !in unparsed) unparsed += it } }
-        return out
+        // ЗАГЛУШКИ И ИНФОРМЕРЫ — НЕ СЕРВЕРЫ.
+        //
+        // Панели пишут «ноды» на 0.0.0.0 / 127.0.0.1 ради текста в имени:
+        // «Приложение не поддерживается», «0.00 GiB/5.00 GiB», «Лимитные
+        // сервера». В списке они выглядели серверами, и к ним даже пытались
+        // подключиться. Если кроме них ничего нет — это заглушка целиком:
+        // запоминаем текст, чтобы показать в журнале, и считаем, что нод нет.
+        val real = out.filterNot { placeholder(it) }
+        if (real.isEmpty() && out.isNotEmpty())
+            lastStub = out.joinToString(" · ") { it.name.trim() }.take(200)
+        return real
     }
+
+    private val FAKE_HOSTS = setOf("0.0.0.0", "127.0.0.1", "::", "::1", "localhost", "")
+    private fun placeholder(n: Node) = n.addr.trim('[', ']') in FAKE_HOSTS || n.port <= 1
 
     // Как показать непонятую ссылку, ничего не выдав: схема, хост и длина.
     private fun safeShape(line: String): String {

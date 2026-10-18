@@ -290,6 +290,12 @@ class MainActivity : ComponentActivity() {
         com.zen.blaster.core.Resolver.preferred = prefs.preDnsUrl()
         com.zen.blaster.core.Resolver.attach(this)
         ConfigBuilder.deviceFp = prefs.deviceFingerprint()
+        // Основа HWID для панелей с лимитом устройств (см. Subscriptions.device):
+        // ANDROID_ID постоянен для пары «устройство + ключ подписи приложения».
+        com.zen.blaster.core.Subscriptions.deviceId = try {
+            android.provider.Settings.Secure.getString(contentResolver,
+                android.provider.Settings.Secure.ANDROID_ID).orEmpty()
+        } catch (_: Throwable) { "" }.ifEmpty { prefs.deviceFingerprint() + "-" + android.os.Build.MODEL }
 
         ZenVpnService.onLog = { runOnUiThread { log(it) } }
         ZenVpnService.onState = { on -> runOnUiThread {
