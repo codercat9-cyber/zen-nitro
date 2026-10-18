@@ -330,6 +330,29 @@ class Prefs(context: Context) {
         sp.edit().putString("noFront", next.joinToString("\n")).apply()
     }
 
+    // НОДЫ, КОТОРЫЕ ПОДНИМАЮТСЯ ТОЛЬКО ЧЕРЕЗ XRAY.
+    //
+    // Серверы Sirius (и не только) настроены под Happ, то есть под Xray: часть
+    // из них sing-box не пускает вовсе — «reality verification failed», хотя
+    // Xray с теми же ключами проходит за 0,1–0,8 с (проверено 18.10.2026 на
+    // de8/srv88/glaveda/paruscamp, gRPC nl7/us7). Раз нода поднялась через
+    // Xray после отказа sing-box — запоминаем и в следующий раз идём сразу им.
+    fun xrayNodes(): Set<String> =
+        (sp.getString("xrayNodes", "") ?: "").split("\n").filter { it.isNotEmpty() }.toSet()
+
+    fun rememberXrayNode(key: String) {
+        if (key.isEmpty()) return
+        val cur = xrayNodes()
+        if (key in cur) return
+        sp.edit().putString("xrayNodes", (cur + key).toList().takeLast(200).joinToString("\n")).apply()
+    }
+
+    fun forgetXrayNode(key: String) {
+        val cur = xrayNodes()
+        if (key !in cur) return
+        sp.edit().putString("xrayNodes", (cur - key).joinToString("\n")).apply()
+    }
+
     fun forgetFrontHostile(key: String) {
         val next = frontHostile() - key
         sp.edit().putString("noFront", next.joinToString("\n")).apply()
@@ -598,9 +621,15 @@ class Prefs(context: Context) {
     fun subscriptions(): List<Subscription> {
         val raw = sp.getString("subs", null) ?: return defaultSubs()
         val arr = JSONArray(raw)
-        return (0 until arr.length()).map {
+        val all = (0 until arr.length()).map {
             val o = arr.getJSONObject(it); Subscription(o.getString("name"), o.getString("url"))
         }
+        // Одна и та же ссылка дважды — одна подписка, а не две: 18.10.2026
+        // Ultra от Sirius оказалась в списке дважды, и её ноды шли двумя
+        // группами. Лишнее убираем и сохраняем уже без дублей.
+        val uniq = all.distinctBy { it.url.trim() }
+        if (uniq.size != all.size) saveSubscriptions(uniq)
+        return uniq
     }
 
     fun saveSubscriptions(list: List<Subscription>) {
@@ -609,8 +638,29 @@ class Prefs(context: Context) {
         sp.edit().putString("subs", arr.toString()).apply()
     }
 
-    fun addSubscription(name: String, url: String) =
-        saveSubscriptions(subscriptions() + Subscription(name, url))
+    // Имя подписки — по умолчанию адрес сервера, и у одного провайдера их
+    // бывает несколько на одном хосте (у Sirius — Main и Ultra на
+    // s.creati.men): обе звались «s.creati.men», а их ноды сливались в одну
+    // группу. Совпадения разводим номером, а после первой загрузки имя
+    // заменяется заголовком самой панели (см. Subscriptions.renamed).
+    // false — такая ссылка уже есть.
+    fun addSubscription(name: String, url: String): Boolean {
+        val cur = subscriptions()
+        if (cur.any { it.url.trim() == url.trim() }) return false
+        saveSubscriptions(cur + Subscription(uniqueSubName(name), url))
+        return true
+    }
+
+    fun uniqueSubName(base: String, exceptUrl: String = ""): String {
+        val taken = subscriptions().filter { it.url != exceptUrl }.map { it.name }.toSet()
+        if (base !in taken) return base
+        var i = 2
+        while ("$base ($i)" in taken) i++
+        return "$base ($i)"
+    }
+
+    fun renameSubscription(url: String, name: String) =
+        saveSubscriptions(subscriptions().map { if (it.url == url) it.copy(name = name) else it })
 
     fun removeSubscription(index: Int) =
         saveSubscriptions(subscriptions().filterIndexed { i, _ -> i != index })

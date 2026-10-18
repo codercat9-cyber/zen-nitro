@@ -146,6 +146,11 @@ class MainActivity : ComponentActivity() {
     // Примета ноды: по ней находим ту же самую после пересборки списка.
     private fun keyOf(n: com.zen.blaster.model.Node) = "${n.addr}:${n.port}|${n.name}"
 
+    // Отказ Reality от sing-box на текущей попытке (см. ZenVpnService.onCoreReject)
+    // и каким ядром она шла: откат true/false или null — выбор по умолчанию.
+    @Volatile private var coreRejected = false
+    private var attemptForceXray: Boolean? = null
+
     // Примета для ПОМЕТОК О ПОВЕДЕНИИ ноды — без имени.
     //
     // Имя провайдер меняет когда захочет: «ICEbreaker» 6 сентября 2026 разом
@@ -298,6 +303,7 @@ class MainActivity : ComponentActivity() {
         } catch (_: Throwable) { "" }.ifEmpty { prefs.deviceFingerprint() + "-" + android.os.Build.MODEL }
 
         ZenVpnService.onLog = { runOnUiThread { log(it) } }
+        ZenVpnService.onCoreReject = { coreRejected = true }
         ZenVpnService.onState = { on -> runOnUiThread {
             connState.intValue = if (on) 2 else 0
             // ТУННЕЛЬ ПОДНЯЛСЯ — ЗНАЧИТ НОДА ЖИВАЯ, ЧЕМ БЫ ОНА НИ ОТВЕЧАЛА
@@ -308,6 +314,16 @@ class MainActivity : ComponentActivity() {
             // списке ровно как мёртвая.
             if (on && engine.intValue != 1) nodes.getOrNull(selected.intValue)?.let { n ->
                 prefs.rememberCarrierWin(com.zen.blaster.core.NetInfo.carrierKey(this), traitKey(n))
+                // Встала откатом на Xray — запоминаем; встала откатом на
+                // sing-box — значит, Xray ей больше не обязателен.
+                when (attemptForceXray) {
+                    true -> if (traitKey(n) !in prefs.xrayNodes()) {
+                        prefs.rememberXrayNode(traitKey(n))
+                        log("🧠 Запомнил: «${n.name}» — через Xray, в следующий раз сразу")
+                    }
+                    false -> prefs.forgetXrayNode(traitKey(n))
+                    null -> {}
+                }
                 cascadeTried.clear(); cascadeIdle = 0
                 n.lastOkAt = System.currentTimeMillis()
                 n.silentTries = 0
@@ -653,6 +669,16 @@ class MainActivity : ComponentActivity() {
             val fresh = Subscriptions.loadAll(sources,
                 gentle = com.zen.blaster.core.NetInfo.snapshot(this@MainActivity).mobile,
                 measure = pingDue)
+            // Подписки, получившие имя от своей панели, — запоминаем навсегда.
+            for ((url, name) in Subscriptions.renamed) prefs.renameSubscription(url, name)
+            // Дальше сверка ответов идёт по ИМЕНАМ подписок — берём новые.
+            // Прошлые ноды переименованной подписки переводим под новое имя,
+            // если оно однозначно: иначе они ушли бы в «промолчала» и встали
+            // в список второй копией рядом со свежими.
+            val srcs = sources.map { s -> Subscriptions.renamed[s.url]?.let { Subscription(it, s.url) } ?: s }
+            val byOld = sources.zip(srcs).filter { it.first.name != it.second.name }
+                .groupBy({ it.first.name }, { it.second.name })
+            for (n in nodes) byOld[n.sub]?.distinct()?.singleOrNull()?.let { n.sub = it }
             if (pingDue && fresh.isNotEmpty()) prefs.lastPingAll = System.currentTimeMillis()
             com.zen.blaster.core.Blackbox.note(
                 if (pingDue) "📡 пинги серверов перемерены"
@@ -687,7 +713,7 @@ class MainActivity : ComponentActivity() {
             // с каждым обновлением (12 → 48 → 96), одни и те же ноды стояли
             // подряд по пять раз.
             val handled = mutableSetOf<String>()
-            for (src in sources) {
+            for (src in srcs) {
                 if (!handled.add(src.name)) continue
                 if ((gotBySub[src.name]?.size ?: 0) > 0) continue
                 val prev = nodes.filter { it.sub == src.name }
@@ -709,7 +735,7 @@ class MainActivity : ComponentActivity() {
             // Спасённые (из молчавшей подписки) сюда НЕ попадают: там источник
             // вообще не ответил, и делать вывод о судьбе конкретной ноды
             // нельзя. Пропажа считается только по подпискам, которые ответили.
-            val answered = sources.map { it.name }.filter { (gotBySub[it]?.size ?: 0) > 0 }.toSet()
+            val answered = srcs.map { it.name }.filter { (gotBySub[it]?.size ?: 0) > 0 }.toSet()
             val freshKeys = fresh.map { nodeKey(it) }.toSet()
             // Примета БЕЗ адреса. Нода, у которой сменился только IP, — это та
             // же нода, а не пропавшая плюс новая. Провайдеры с ротацией адресов
@@ -1217,7 +1243,13 @@ class MainActivity : ComponentActivity() {
         // 14.08.2026 это сменило ядро у нод, которые прекрасно работали через
         // sing-box, и перестали работать ВСЕ разом. Менять рабочее ради
         // красивой идеи нельзя, поэтому откат к прежнему правилу.
-        val autoXray = vpnOn && n != null && XrayEngine.handles(n) && XrayEngine.available(this)
+        // Нода, которая в прошлый раз встала только через Xray, — сразу им.
+        val remembered = n != null && XrayEngine.bothPossible(n) && traitKey(n) in prefs.xrayNodes()
+        val autoXray = vpnOn && n != null && (XrayEngine.handles(n) || remembered) && XrayEngine.available(this)
+        if (remembered && forceXray == null && prefs.tunnelEngine == 0)
+            log("🧠 «${n!!.name}» в прошлый раз поднялась только через Xray — сразу через него")
+        coreRejected = false
+        attemptForceXray = forceXray
         val pinned = prefs.tunnelEngine          // 0 авто, 1 sing-box, 2 Xray
         val viaXray = when {
             forceXray != null -> forceXray && XrayEngine.available(this)  // это откат
@@ -1365,9 +1397,31 @@ class MainActivity : ComponentActivity() {
                 else -> 20_000L
             } * (if (pat > 2) 2 else 1)  // на заведомо медленном канале — вдвое
             lifecycleScope.launch {
-                kotlinx.coroutines.delay(waitMs)
+                // Ждём таймаут, но просыпаемся раньше, если sing-box получил от
+                // сервера отказ Reality: этот сервер его не пустит, сколько ни
+                // жди, — а Xray с теми же ключами проходит за доли секунды.
+                var waited = 0L
+                while (waited < waitMs && !(coreRejected && canFallback && !viaXray)) {
+                    kotlinx.coroutines.delay(250); waited += 250
+                    if (gen != connectAttempt || connState.intValue == 2) break
+                }
+                // КАНАЛ УЖЕ ЖИВОЙ — ДАЁМ ПРОВЕРКАМ ДОЙТИ.
+                //
+                // 18.10.2026 «Белые списки #1» через sing-box: канал живой на
+                // 3-й секунде, YouTube ответил на 10-й, а проверка DNS через
+                // туннель не уложилась в окно — и на 20-й таймер объявил
+                // «sing-box не поднял ноду» и порвал рабочий туннель ради
+                // Xray. Замер через ядро уже прошёл — значит, ждём исхода
+                // остальных проверок, ещё до 25 секунд.
+                var extra = 0L
+                while (gen == connectAttempt && connState.intValue != 2 &&
+                       ZenVpnService.channelProven && extra < 25_000L) {
+                    kotlinx.coroutines.delay(250); extra += 250
+                }
                 if (gen != connectAttempt) return@launch      // уже другое подключение
                 if (connState.intValue == 2) return@launch    // поднялось, всё хорошо
+                val rejected = coreRejected && canFallback && !viaXray
+                if (rejected) log("⚡ Сервер не пустил sing-box (Reality) — сразу пробую Xray")
 
                 // ПЕРВЫЙ ОТКАТ — СНЯТЬ ПОДМЕНУ ИМЕНИ.
                 //
@@ -1382,7 +1436,7 @@ class MainActivity : ComponentActivity() {
                 //
                 // Поэтому первым делом пробуем то же самое, но с родным именем
                 // сервера, и только потом идём менять ядро.
-                if (front.isNotEmpty() && n.frontable()) {
+                if (!rejected && front.isNotEmpty() && n.frontable()) {
                     log("⚠️ Серверу, похоже, не нравится подменённое имя — пробую с его собственным")
                     com.zen.blaster.core.Blackbox.outcome(false,
                         "не поднялось за ${waitMs / 1000} с с подменой имени на $front — " +
@@ -1393,7 +1447,7 @@ class MainActivity : ComponentActivity() {
                     frontFailedFor = keyOf(n)
                     toggleConnect(force = true, forceXray = forceXray,
                         noFront = true, noChain = noChain)
-                } else if (chainOn && !n.wl && n.type != "Hysteria2" && n.type != "TUIC") {
+                } else if (!rejected && chainOn && !n.wl && n.type != "Hysteria2" && n.type != "TUIC") {
                     // ВТОРОЙ ОТКАТ — УБРАТЬ ByeDPI ИЗ ЦЕПОЧКИ.
                     //
                     // Щит и VPN — две независимые функции, и сцепка их в одну
@@ -1420,7 +1474,8 @@ class MainActivity : ComponentActivity() {
                     // Записываем исход ДО stopTunnel: иначе остановка закроет
                     // сеанс как «прервано» и в журнале пропадёт причина отката.
                     com.zen.blaster.core.Blackbox.outcome(false,
-                        "${if (viaXray) "Xray" else "sing-box"} не отозвался за " +
+                        if (rejected) "sing-box: сервер отказал в рукопожатии Reality — перехожу на Xray"
+                        else "${if (viaXray) "Xray" else "sing-box"} не отозвался за " +
                         "${waitMs / 1000} с — перехожу на второе ядро")
                     stopTunnel()
                     kotlinx.coroutines.delay(900)
@@ -3176,12 +3231,11 @@ class MainActivity : ComponentActivity() {
                                     runCatching { java.net.URI(raw).host }.getOrNull() ?: "Подписка"
                                 else -> "Конфиг"
                             }.take(40)
-                            prefs.addSubscription(name, raw)
-                            added++
+                            if (prefs.addSubscription(name, raw)) added++
                         }
                         subs = prefs.subscriptions()
                         input = ""
-                        log("➕ Добавлено записей: $added")
+                        log(if (added > 0) "➕ Добавлено записей: $added" else "• Эти ссылки уже есть в списке")
                         loadServers()
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = ZenCyan),

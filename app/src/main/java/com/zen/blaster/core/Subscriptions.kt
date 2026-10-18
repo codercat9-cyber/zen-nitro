@@ -48,12 +48,29 @@ object Subscriptions {
         report.clear()
         val nodes = mutableListOf<Node>()
         info = ""
+        renamed.clear()
+        val used = subs.map { it.name }.toMutableSet()
         for (s in subs) {
             report += "▪ ${s.name}"
+            val part = fetchOne(s.url)
+            // Подписка звалась адресом сервера, а панель назвала себя сама —
+            // берём её имя («SiriusVPN 🚀 Ultra» вместо второго «s.creati.men»).
+            val title = titles[s.url].orEmpty()
+            // «Имя (2)» от заголовка, когда двойника уже нет, — тоже наше: его
+            // возвращаем к чистому имени панели.
+            val numbered = title.isNotEmpty() && s.name != title &&
+                Regex("^" + Regex.escape(title) + " \\(\\d+\\)$").matches(s.name)
+            val name = if (title.isNotEmpty() && (autoNamed(s) || (numbered && title !in used))) {
+                used -= s.name
+                var n = title; var i = 2
+                while (n in used) n = "$title (${i++})"
+                used += n; renamed[s.url] = n
+                report += "   ✏️ называю «$n»"
+                n
+            } else s.name
             // Помечаем каждую ноду её подпиской: иначе в общем списке из сотни
             // серверов не понять, кто чей.
-            val part = fetchOne(s.url).onEach { it.sub = s.name }
-            nodes += part
+            nodes += part.onEach { it.sub = name }
         }
         if (measure) pingAll(nodes, gentle)
         // Сначала по подписке (чтобы группы шли подряд), внутри — по протоколу
@@ -260,9 +277,25 @@ object Subscriptions {
             // из первого ответа, где это есть: у всех имён клиента оно одно.
             if (info.isEmpty()) userInfo(r.header("subscription-userinfo"), r.header("profile-title"))
                 ?.let { info = it }
+            titleOf(r.header("profile-title")).takeIf { it.isNotEmpty() }?.let { titles[url] = it }
             r.code to (r.body?.string() ?: "")
         }
     } catch (e: Exception) { null }
+
+    // Заголовки панелей (profile-title) по адресу подписки и подписки,
+    // которые на этой загрузке получили имя из заголовка.
+    val titles = java.util.concurrent.ConcurrentHashMap<String, String>()
+    val renamed = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    private fun autoNamed(s: Subscription): Boolean {
+        val host = try { java.net.URI(s.url.trim()).host.orEmpty() } catch (_: Exception) { "" }
+        return host.isNotEmpty() && (s.name == host || Regex("^" + Regex.escape(host) + " \\(\\d+\\)$").matches(s.name))
+    }
+
+    private fun titleOf(raw: String?): String = raw?.let {
+        if (it.startsWith("base64:")) try { String(Base64.decode(it.removePrefix("base64:"), Base64.DEFAULT)) }
+            catch (_: Exception) { "" } else it
+    }.orEmpty().replace(Regex("\\s*-:\\d+\\s*$"), "").trim().take(40)
 
     // ЛИМИТ УСТРОЙСТВ (HWID).
     //

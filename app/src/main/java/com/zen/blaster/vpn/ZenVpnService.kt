@@ -62,6 +62,13 @@ class ZenVpnService : VpnService(), PlatformInterface {
 
         var onLog: ((String) -> Unit)? = null
         var onState: ((Boolean) -> Unit)? = null
+        // Сервер отказал ядру sing-box в рукопожатии Reality — подъёму наверху
+        // нет смысла ждать таймаута, второе ядро можно пробовать сразу.
+        @Volatile var onCoreReject: ((String) -> Unit)? = null
+        // Канал этой попытки уже доказан (замер через ядро прошёл), идут
+        // только дополнительные проверки. Таймер отката наверху в этот
+        // момент рвать туннель не должен.
+        @Volatile var channelProven = false
     }
 
     private var boxService: BoxCore? = null
@@ -158,7 +165,12 @@ class ZenVpnService : VpnService(), PlatformInterface {
         onLog?.invoke(clean)
         catchCertMismatch(clean)
         catchDeadInterface(clean)
+        if (!realityRejectSaid && clean.contains("reality verification failed")) {
+            realityRejectSaid = true
+            onCoreReject?.invoke("reality")
+        }
     }
+    @Volatile private var realityRejectSaid = false
 
     // СТРАХОВКА: ЯДРО ЗВОНИТ ЧЕРЕЗ ИНТЕРФЕЙС, КОТОРОГО БОЛЬШЕ НЕТ.
     //
@@ -324,6 +336,8 @@ class ZenVpnService : VpnService(), PlatformInterface {
         // «Подключено» — весь трафик при этом шёл мимо туннеля, с настоящим IP.
         certSaid = false
         dnsCertSaid = false
+        realityRejectSaid = false
+        channelProven = false
         starting.set(true)
         // Поколение поднимаем ПЕРВЫМ делом: с этой секунды любой поток прошлого
         // подъёма видит, что он больше не нужен, и не лезет ни в уведомление,
@@ -1190,6 +1204,7 @@ class ZenVpnService : VpnService(), PlatformInterface {
         if (delay <= 0) return false
         Stats.ping.value = delay
         Stats.feedPing(delay)
+        channelProven = true
         say("✅ Канал живой: $delay мс")
         Stats.stage.value = "Канал живой · $delay мс"
         Thread.sleep(400)
