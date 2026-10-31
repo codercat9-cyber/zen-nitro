@@ -36,7 +36,7 @@ object LocalProbe {
     // Через HTTP-прокси того же входа, а не SOCKS: у SOCKS в Java пароль
     // передать толком нечем, а HTTP-прокси берёт его заголовком. OkHttp
     // спрашивает proxyAuthenticator заранее, ещё до CONNECT для https.
-    private fun through(): okhttp3.OkHttpClient = okhttp3.OkHttpClient.Builder()
+    fun through(): okhttp3.OkHttpClient = okhttp3.OkHttpClient.Builder()
         .proxy(java.net.Proxy(java.net.Proxy.Type.HTTP,
             java.net.InetSocketAddress("127.0.0.1", port)))
         .proxyAuthenticator { _, resp ->

@@ -199,47 +199,81 @@ object Updater {
         File(ctx.getExternalFilesDir(null) ?: ctx.filesDir, "update/ZenNitro-update.apk")
 
     // onProgress(0..100); -1 — размер неизвестен, показываем просто «качаю».
+    // СКАЧАТЬ ОБНОВЛЕНИЕ — через туннель, с докачкой, с причиной в журнале.
+    //
+    //  31.10.2026 человек не смог скачать 3.7, а сервер в это время отдавал
+    //  её целиком (проверено с телефона снаружи). Три слабости было у нас:
+    //   • качали МИМО своего туннеля (приложение из него исключено) — где
+    //     оператор режет путь до нашего сервера, обновление не шло даже при
+    //     работающем VPN. Теперь при поднятом туннеле — сначала через него
+    //     (локальный вход ядра, LocalProbe), потом напрямую;
+    //   • обрыв на 80 % — всё сначала. Сервер умеет Range (206), так что
+    //     докачиваем с места обрыва, до пяти попыток на путь;
+    //   • причина нигде не оставалась — теперь каждая неудача в журнале.
     suspend fun download(ctx: Context, rel: Release, onProgress: (Int) -> Unit): File? =
         withContext(Dispatchers.IO) {
             val out = apkFile(ctx)
             out.parentFile?.mkdirs()
             val tmp = File(out.parentFile, out.name + ".part")
-            var total = 0L
-            try {
-                http.newCall(Request.Builder().url(rel.url).build()).execute().use { r ->
-                    if (!r.isSuccessful) return@withContext null
-                    val body = r.body ?: return@withContext null
-                    // Длину берём ИЗ ОТВЕТА, а не из манифеста: размер в
-                    // манифесте один на все архитектуры, а APK у arm64, arm32
-                    // и x86_64 разного веса — проценты бы врали, а проверка
-                    // целостности резала бы годную закачку.
-                    val declared = body.contentLength()
-                    total = if (declared > 0) declared else rel.size
-                    body.byteStream().use { input ->
-                        tmp.outputStream().use { output ->
-                            val buf = ByteArray(64 * 1024)
-                            var done = 0L
+            tmp.delete()
+            var total = rel.size
+            var lastErr = ""
+            val paths = buildList {
+                if (com.zen.blaster.vpn.ZenVpnService.running) add(Triple("через туннель",
+                    LocalProbe.through().newBuilder()
+                        .readTimeout(30, TimeUnit.SECONDS)
+                        .addInterceptor { ch -> ch.proceed(ch.request().newBuilder().header("User-Agent", UA).build()) }
+                        .build(), 2))
+                add(Triple("напрямую", http, 5))
+            }
+            for ((how, client, tries) in paths) {
+                for (attempt in 1..tries) {
+                    val have = tmp.length()
+                    try {
+                        val rb = Request.Builder().url(rel.url)
+                        if (have > 0) rb.header("Range", "bytes=$have-")
+                        client.newCall(rb.build()).execute().use { r ->
+                            if (r.code == 416 && have > 0) return@use            // уже всё скачано
+                            if (!r.isSuccessful) throw java.io.IOException("HTTP ${r.code}")
+                            val append = have > 0 && r.code == 206
+                            val body = r.body ?: throw java.io.IOException("пустой ответ")
+                            val len = body.contentLength()
+                            if (len > 0) total = (if (append) have else 0L) + len
                             var lastPct = -1
-                            while (true) {
-                                val n = input.read(buf)
-                                if (n < 0) break
-                                output.write(buf, 0, n)
-                                done += n
-                                if (total > 0) {
-                                    val pct = ((done * 100) / total).toInt().coerceIn(0, 100)
-                                    // Дёргаем UI только на смене процента,
-                                    // а не 400 раз в секунду.
-                                    if (pct != lastPct) { lastPct = pct; onProgress(pct) }
-                                } else onProgress(-1)
+                            java.io.FileOutputStream(tmp, append).use { o ->
+                                body.byteStream().use { i ->
+                                    val buf = ByteArray(64 * 1024)
+                                    var done = if (append) have else 0L
+                                    while (true) {
+                                        val n = i.read(buf)
+                                        if (n < 0) break
+                                        o.write(buf, 0, n); done += n
+                                        if (total > 0) {
+                                            val pct = ((done * 100) / total).toInt().coerceIn(0, 100)
+                                            if (pct != lastPct) { lastPct = pct; onProgress(pct) }
+                                        } else onProgress(-1)
+                                    }
+                                }
                             }
                         }
+                        if (total <= 0 || tmp.length() >= total) {
+                            out.delete()
+                            if (!tmp.renameTo(out)) { lastErr = "не удалось сохранить файл"; break }
+                            Blackbox.note("⬇️ обновление ${rel.name} скачано $how" +
+                                (if (attempt > 1 || have > 0) " (с докачкой)" else ""))
+                            return@withContext out
+                        }
+                        lastErr = "оборвалось на ${tmp.length() / 1024} из ${total / 1024} КБ"
+                    } catch (e: Exception) {
+                        lastErr = "${e.javaClass.simpleName}: ${e.message}" +
+                            (if (tmp.length() > 0) " · есть ${tmp.length() / 1024} КБ" else "")
                     }
+                    Blackbox.note("⬇️ обновление $how, попытка $attempt: $lastErr")
+                    Thread.sleep(1500)
                 }
-                // Явная проверка: оборванная закачка почти всегда короче.
-                if (total > 0 && tmp.length() < total) { tmp.delete(); return@withContext null }
-                out.delete()
-                if (!tmp.renameTo(out)) { tmp.delete(); return@withContext null }
-                out
-            } catch (_: Exception) { tmp.delete(); null }
+            }
+            Blackbox.note("❌ обновление ${rel.name} не скачалось: $lastErr")
+            tmp.delete()
+            null
         }
 }
