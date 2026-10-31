@@ -487,7 +487,12 @@ class MainActivity : ComponentActivity() {
                 runOnUiThread { updProgress.intValue = pct }
             }
             updProgress.intValue = -2
-            if (f == null) { log("❌ Не скачалось — сеть или адрес"); toast("Обновление не скачалось") }
+            if (f == null) {
+                // Самая частая причина — мёртвый туннель: обновление идёт через
+                // него. Говорим прямо, что делать, а подробности — в журнал.
+                log("❌ Обновление не скачалось. Отключите VPN и нажмите ещё раз — причина в журнале")
+                toast("Не скачалось. Отключите VPN и нажмите ещё раз")
+            }
             else { updReady.value = f; log("✔ Скачано, жду нажатия «установить»"); installUpdate() }
         }
     }

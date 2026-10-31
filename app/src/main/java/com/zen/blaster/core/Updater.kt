@@ -55,6 +55,22 @@ object Updater {
         }
         .build()
 
+    // «Напрямую» — это через ФИЗИЧЕСКУЮ сеть, мимо туннеля. Обычный клиент
+    // при поднятом VPN ходит В туннель (в режиме sing-box приложение из него
+    // не исключено). 31.10.2026, Realme: туннель был мёртв (938 возвратов по
+    // испорченному конфигу), и обновление не получило ни байта; с выключенным
+    // VPN то же самое скачалось за 9 секунд. Привязываем и сокеты, и DNS к
+    // физической сети — как пинг и проверка линии.
+    private fun direct(): OkHttpClient {
+        val net = Resolver.physical() ?: return http
+        return http.newBuilder()
+            .socketFactory(net.socketFactory)
+            .dns(object : okhttp3.Dns {
+                override fun lookup(hostname: String) = net.getAllByName(hostname).toList()
+            })
+            .build()
+    }
+
     // Раз в сутки. Чаще нет смысла, а на мобильном трафике каждый лишний
     // запрос — это ещё и лишний след наружу.
     private const val PERIOD_MS = 22L * 60 * 60 * 1000
@@ -218,13 +234,16 @@ object Updater {
             tmp.delete()
             var total = rel.size
             var lastErr = ""
+            // Сначала напрямую по физической сети — так быстрее всего и не
+            // зависит от того, жив ли туннель. Не вышло, а туннель поднят —
+            // через него: там, где оператор режет путь до нашего сервера.
             val paths = buildList {
+                add(Triple("напрямую", direct(), 3))
                 if (com.zen.blaster.vpn.ZenVpnService.running) add(Triple("через туннель",
                     LocalProbe.through().newBuilder()
                         .readTimeout(30, TimeUnit.SECONDS)
                         .addInterceptor { ch -> ch.proceed(ch.request().newBuilder().header("User-Agent", UA).build()) }
                         .build(), 2))
-                add(Triple("напрямую", http, 5))
             }
             for ((how, client, tries) in paths) {
                 for (attempt in 1..tries) {
