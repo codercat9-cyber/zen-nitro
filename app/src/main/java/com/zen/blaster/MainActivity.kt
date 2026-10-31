@@ -12,6 +12,7 @@ import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.material.icons.Icons
@@ -64,6 +65,7 @@ import com.zen.blaster.ui.*
 import com.zen.blaster.vpn.ZenAwgService
 import com.zen.blaster.vpn.ZenVpnService
 import kotlinx.coroutines.async
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
@@ -143,6 +145,13 @@ class MainActivity : ComponentActivity() {
     // просто не появлялись.
     private val pingTick = mutableIntStateOf(0)
 
+    // Ход ручного замера: сколько нод уже померено из скольких; -1 — замер не
+    // идёт. Видно на самой кнопке: «пинг 37/145». Раньше цифры появлялись
+    // разом в самом конце, и до того кнопка выглядела мёртвой.
+    private val pingDone = mutableIntStateOf(-1)
+    private val pingTotal = mutableIntStateOf(0)
+    @Volatile private var pingQueued = false
+
     // Примета ноды: по ней находим ту же самую после пересборки списка.
     private fun keyOf(n: com.zen.blaster.model.Node) = "${n.addr}:${n.port}|${n.name}"
 
@@ -158,6 +167,38 @@ class MainActivity : ComponentActivity() {
     // сервер предъявляет чужой сертификат) перестали к ней относиться —
     // клиент заново наступал на те же грабли. Адрес и порт устойчивее.
     private fun traitKey(n: com.zen.blaster.model.Node) = "${n.addr}:${n.port}"
+
+    // ------------------------------------------------------ крестик у ноды
+    //
+    //  Убрать можно то, от чего в списке нет толку: пропавшее из выдачи,
+    //  неподдерживаемое ядром и молчащее. Молчащую, через которую туннель
+    //  хоть раз поднимался (lastOkAt), крестом не метим: на сотовой связи
+    //  пробы режутся у живых серверов, и «молчит» там не значит «мёртв».
+    private fun dismissKey(n: Node) = "${n.sub}|${n.addr}:${n.port}"
+
+    private fun removable(n: Node) = !n.supported() || n.gone ||
+        (n.lastOkAt == 0L && (n.ping >= 900 || (n.ping < 0 && n.silentTries >= Node.SILENT_LIMIT)))
+
+    private fun dismissNodes(drop: List<Node>) {
+        if (drop.isEmpty()) return
+        val keys = drop.map { dismissKey(it) }.toSet()
+        prefs.dismissNodes(keys)
+        nodes.removeAll { dismissKey(it) in keys }
+        restoreSelection()
+        prefs.cacheNodes(nodes.toList())
+        pingTick.intValue++
+        toast(if (drop.size == 1) "Убрано: ${drop[0].name}" else "Убрано нод: ${drop.size}")
+        com.zen.blaster.core.Blackbox.note("✕ убраны вручную: " +
+            drop.joinToString(", ") { "«${it.name}» ${it.addr}" }.take(300))
+    }
+
+    // Вернуть всё убранное: забываем список и тянем подписки заново.
+    private fun restoreDismissed() {
+        val n = prefs.dismissedNodes().size
+        prefs.clearDismissed()
+        toast("Вернул убранные ($n) — обновляю подписки")
+        loadServers()
+    }
 
     // Дата пропажи ноды — коротко, «19.08». Год не пишем: нода, пропавшая
     // больше недели назад, до списка не доживает.
@@ -185,6 +226,18 @@ class MainActivity : ComponentActivity() {
     // (у одного провайдера бывают тёзки — «🇧🇪Belgium [Hysteria2]» в списке
     // fastlanehosting встречается дважды), но чтобы отличить переезд от
     // исчезновения — ровно то, что нужно.
+    // Паспорт сервера без имени и подписки — по нему сводятся зеркала.
+    // ВСЕ параметры подключения: провайдеры отдают варианты одного сервера,
+    // отличающиеся только режимом XHTTP, flow или отпечатком, — это разные
+    // ноды, склеивать можно лишь точные копии (первая версия ключа на живых
+    // подписках 31.10 склеила 22 ноды из 144 — слишком жадно).
+    private fun serverKey(n: Node): String = listOf(
+        n.type, n.transport, "${n.addr}:${n.port}", n.uuid, n.auth, n.password, n.method,
+        n.encryption, n.sni, n.pbk, n.sid, n.flow, n.path, n.host, n.serviceName, n.alpn,
+        n.security, n.fp, n.obfs, n.obfsPw, n.mode, n.extra, n.hopPorts, n.seed, n.headerType,
+        n.alterId.toString(), n.insecure.toString(), n.cc
+    ).joinToString("|")
+
     private fun movedKey(n: Node): String =
         "${n.sub}|${n.type}|${n.transport}|${n.name}"
 
@@ -314,6 +367,7 @@ class MainActivity : ComponentActivity() {
             // списке ровно как мёртвая.
             if (on && engine.intValue != 1) nodes.getOrNull(selected.intValue)?.let { n ->
                 prefs.rememberCarrierWin(com.zen.blaster.core.NetInfo.carrierKey(this), traitKey(n))
+                prefs.rememberCarrierLoss(com.zen.blaster.core.NetInfo.carrierKey(this), traitKey(n), lost = false)
                 // Встала откатом на Xray — запоминаем; встала откатом на
                 // sing-box — значит, Xray ей больше не обязателен.
                 when (attemptForceXray) {
@@ -387,8 +441,10 @@ class MainActivity : ComponentActivity() {
 
         // Сначала показываем кэш — приложение открывается со списком серверов
         // сразу, даже если сеть лежит и подписки не ответят.
-        nodes.addAll(prefs.cachedNodes())
+        val dismissed = prefs.dismissedNodes()
+        nodes.addAll(prefs.cachedNodes().filterNot { dismissKey(it) in dismissed })
         restoreSelection()
+        checkCoresQuietly()
 
         setContent { ZenTheme { HomeScreen() } }
         autoRefreshSubs()
@@ -507,6 +563,19 @@ class MainActivity : ComponentActivity() {
     // нажавший кнопку в шапке, должен видеть ответ сразу и на месте.
     private fun toast(s: String) =
         android.widget.Toast.makeText(this, s, android.widget.Toast.LENGTH_SHORT).show()
+
+    // Кнопка-действие в шапке списка. Рамка вместо голого слова: видно, что
+    // это кнопка, и в неё проще попасть пальцем.
+    @Composable
+    private fun ActionChip(label: String, onClick: () -> Unit) {
+        val shape = RoundedCornerShape(50)
+        Text(label, color = ZenCyan, fontSize = 13.sp, maxLines = 1,
+            modifier = Modifier
+                .clip(shape)
+                .border(1.dp, ZenCyan.copy(alpha = 0.45f), shape)
+                .clickable(onClick = onClick)
+                .padding(horizontal = 12.dp, vertical = 6.dp))
+    }
 
     override fun onNewIntent(i: Intent) { super.onNewIntent(i); handleImportIntent(i) }
 
@@ -656,9 +725,22 @@ class MainActivity : ComponentActivity() {
             try {
             // Ручные ссылки идут теми же путями, что и подписки: парсер
             // Subscriptions понимает и голый vless://, и адрес подписки.
-            val sources = prefs.wlLinks().map { Subscription(WL_GROUP, it) } +
+            val allSources = prefs.wlLinks().map { Subscription(WL_GROUP, it) } +
                 prefs.subscriptions() +
                 prefs.manualLinks().map { Subscription("Свои ссылки", it) }
+            // ОДНА ССЫЛКА — ОДИН ИСТОЧНИК.
+            //
+            // 31.10: ссылка «Rem-iCDN» стояла и в белом списке, и в подписках.
+            // Её тянули дважды и показывали одну ноду в двух группах. Тянем
+            // один раз; первым в списке идёт белый список — он и остаётся:
+            // аварийная пометка даёт ноде больше, чем обычная подписка.
+            val seenUrls = HashSet<String>()
+            val sources = allSources.filter { seenUrls.add(it.url.trim().trimEnd('/')) }
+            if (sources.size < allSources.size) {
+                val twice = (allSources - sources.toSet()).joinToString(", ") { "«${it.name}»" }
+                log("♊ Одна и та же ссылка добавлена дважды: $twice — тяну один раз")
+                com.zen.blaster.core.Blackbox.note("♊ повтор ссылки подписки: $twice — тяну один раз")
+            }
             // На сотовой связи замер идёт щадящим шагом: полный веер по всему
             // списку отнимает у туннеля минуту эфира.
             // Пинг всего списка — не чаще раза в полчаса. Подписки тянутся при
@@ -780,8 +862,27 @@ class MainActivity : ComponentActivity() {
             // И на всякий случай убираем повторы вообще: одна и та же нода
             // может прийти из двух источников сразу.
             val beforeDedup = fresh.size + rescued.size + vanished.size
-            val list = (fresh + rescued + vanished)
-                .distinctBy { nodeKey(it) }
+            val sameSub = (fresh + rescued + vanished).distinctBy { nodeKey(it) }
+            // ЗЕРКАЛА: ОДИН СЕРВЕР ИЗ РАЗНЫХ ПОДПИСОК — ОДНА СТРОКА.
+            //
+            // Ключ nodeKey начинается с имени подписки, и одна и та же нода из
+            // двух источников (зеркальные адреса одной панели, белый список и
+            // подписка) не сводилась никогда — в списке стояли близнецы.
+            // Сводим по «паспорту» сервера: тип, транспорт, адрес, порт, ключ
+            // доступа, имя для TLS и путь. Разные ключи доступа к одному
+            // серверу — разные ноды, их не трогаем. Оставляем живую копию,
+            // а из живых — аварийную, потом подписку, потом ручную ссылку.
+            val deduped = sameSub
+                .sortedWith(compareBy({ it.gone },
+                    { when (it.sub) { WL_GROUP -> 0; "Свои ссылки" -> 2; else -> 1 } }))
+                .distinctBy { serverKey(it) }
+            if (deduped.size < sameSub.size)
+                com.zen.blaster.core.Blackbox.note(
+                    "♊ один сервер в нескольких подписках: ${sameSub.size} → ${deduped.size}")
+            // Убранные крестиком не возвращаем, даже если панель их отдаёт.
+            val dismissed = prefs.dismissedNodes()
+            val list = deduped
+                .filterNot { dismissKey(it) in dismissed }
                 .sortedWith(compareBy(
                 { it.sub },
                 { it.badge() },
@@ -791,9 +892,9 @@ class MainActivity : ComponentActivity() {
             // пропажу было видно сразу: подписка отдаёт 15 нод, в списке 8 —
             // и без этой цифры непонятно, потерялись они при разборе или при
             // сведении.
-            if (beforeDedup > list.size)
+            if (beforeDedup > deduped.size)
                 com.zen.blaster.core.Blackbox.note(
-                    "♊ повторы сведены: $beforeDedup → ${list.size}")
+                    "♊ повторы сведены: $beforeDedup → ${deduped.size}")
             // Помечаем аварийные ноды: по этому флагу к ним применяется
             // отдельный, консервативный набор параметров.
             list.forEach { it.wl = it.sub == WL_GROUP }
@@ -945,6 +1046,11 @@ class MainActivity : ComponentActivity() {
     //  не кончатся все.
     private fun nextCascadeNode(whitelist: Boolean): Int? {
         val wins = prefs.carrierWins(com.zen.blaster.core.NetInfo.carrierKey(this))
+        val losses = prefs.carrierLosses(com.zen.blaster.core.NetInfo.carrierKey(this))
+        // Оператор гасит сессию данных (почерк PdpGuard) — ровный UDP-поток
+        // QUIC-нод виден в соте сильнее всего, поэтому такие ноды ниже.
+        // Раньше это было только советом в журнале.
+        val pdp = com.zen.blaster.core.PdpGuard.lastVerdict.isNotEmpty()
         val now = System.currentTimeMillis()
         fun pool(skipTried: Boolean) = nodes.withIndex().filter { (_, n) ->
             n.supported() && (!whitelist || n.wl) &&
@@ -958,7 +1064,11 @@ class MainActivity : ComponentActivity() {
             cand = pool(true)
         }
         return cand.sortedWith(
-            compareByDescending<IndexedValue<com.zen.blaster.model.Node>> { wins[traitKey(it.value)] ?: 0L }
+            compareBy<IndexedValue<com.zen.blaster.model.Node>> { if (pdp && it.value.quic()) 1 else 0 }
+                // Три провала подряд на этом операторе — в конец очереди,
+                // пока не поднимется хоть раз.
+                .thenBy { if ((losses[traitKey(it.value)] ?: 0) >= 3) 1 else 0 }
+                .thenByDescending { wins[traitKey(it.value)] ?: 0L }
                 .thenByDescending { if (now - it.value.lastOkAt < 24 * 3600_000L) it.value.lastOkAt else 0L }
                 .thenBy { if (it.value.ping > 0) it.value.ping else Int.MAX_VALUE }
         ).firstOrNull()?.index
@@ -971,12 +1081,26 @@ class MainActivity : ComponentActivity() {
         // Веер из двух сотен коннектов идёт ровно поверх рукопожатия — а на
         // узком канале рукопожатию и так тесно. Так терялись QUIC-ноды: они
         // не успевали встать, потому что мы сами же и забирали у них полосу.
+        //
+        // Отказ раньше уходил только в журнал, а журнал на другой вкладке:
+        // человек жал «пинг», не видел ничего и решал, что кнопка зависла.
+        // Теперь замер встаёт в очередь и запускается сам после подъёма.
         if (connState.intValue == 1) {
-            log("⏳ Идёт подключение — замер отложен, он отнимает канал")
+            if (pingQueued) { toast("Замер уже в очереди — после подключения"); return }
+            pingQueued = true
+            toast("Идёт подключение — замерю, как только поднимется")
+            log("⏳ Идёт подключение — замер отложен до подъёма, он отнимает канал")
+            lifecycleScope.launch {
+                kotlinx.coroutines.withTimeoutOrNull(90_000) {
+                    snapshotFlow { connState.intValue }.first { it != 1 }
+                }
+                pingQueued = false
+                if (connState.intValue != 1) repingAll()
+            }
             return
         }
-        if (pingBusy) { log("⏳ Замер уже идёт"); return }
-        if (subsLoading.value) { log("⏳ Обновляются подписки — они перемерят сами"); return }
+        if (pingBusy) { toast("Замер уже идёт: ${pingDone.intValue} из ${pingTotal.intValue}"); return }
+        if (subsLoading.value) { toast("Обновляются подписки — они перемерят сами"); return }
         pingBusy = true
         log("📡 Меряю задержку до серверов…")
         // Ручной замер — тоже замер: следующий сам по себе через полчаса.
@@ -985,11 +1109,32 @@ class MainActivity : ComponentActivity() {
         // пересортировывать нельзя: раньше замер в конце записывал поверх
         // свежих подписок СТАРЫЙ список — обновление молча пропадало.
         val snap = nodes.toList()
+        // Очерёдность замера: выбранная нода, потом её подписка, потом прочие.
+        // На сотовой связи меряем по восемь за раз, и сотня нод — это десятки
+        // секунд; первыми должны появиться цифры там, куда человек смотрит.
+        val cur = nodes.getOrNull(selected.intValue)
+        val order = snap.sortedByDescending {
+            (if (it === cur) 2 else 0) + (if (cur != null && it.sub == cur.sub) 1 else 0)
+        }
+        val done = java.util.concurrent.atomic.AtomicInteger(0)
+        pingTotal.intValue = order.size
+        pingDone.intValue = 0
         lifecycleScope.launch {
+            // Цифры по мере замера. Перерисовка не чаще трёх раз в секунду:
+            // дёргать список на каждую из двухсот нод незачем.
+            val ticker = launch {
+                while (true) {
+                    kotlinx.coroutines.delay(300)
+                    val d = done.get()
+                    if (d != pingDone.intValue) { pingDone.intValue = d; pingTick.intValue++ }
+                }
+            }
             try {
             val t = System.currentTimeMillis()
-            Subscriptions.reping(snap,
-                gentle = com.zen.blaster.core.NetInfo.snapshot(this@MainActivity).mobile)
+            Subscriptions.reping(order,
+                gentle = com.zen.blaster.core.NetInfo.snapshot(this@MainActivity).mobile,
+                onEach = { done.incrementAndGet() })
+            ticker.cancel()
             if (nodes.size != snap.size || nodes.indices.any { nodes[it] !== snap[it] }) {
                 pingTick.intValue++
                 log("📡 Замер закончен, но список уже обновился — перемерю при следующем замере")
@@ -1018,14 +1163,50 @@ class MainActivity : ComponentActivity() {
                         "«${it.name}» ${it.addr} (${it.silentTries}-й раз" +
                         (if (it.lastOkAt > 0L) ", но работала" else "") + ")"
                     } else ""))
-            } finally { pingBusy = false }
+            } finally { ticker.cancel(); pingBusy = false; pingDone.intValue = -1 }
+        }
+    }
+
+    // Проверка линии до ноды: мимо туннеля, по ступеням, с hex-дампом в журнал.
+    // Сама — не чаще раза в 10 минут на ноду: она тоже занимает канал.
+    private val lineProbedAt = HashMap<String, Long>()
+    private fun probeLine(n: Node, manual: Boolean) {
+        val k = traitKey(n)
+        if (!manual && System.currentTimeMillis() - (lineProbedAt[k] ?: 0L) < 10 * 60_000L) return
+        lineProbedAt[k] = System.currentTimeMillis()
+        if (manual) toast("Проверяю линию до «${n.name}»…")
+        log("🩺 Проверка линии до «${n.name}»…")
+        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            val r = com.zen.blaster.core.LineProbe.run(n)
+            com.zen.blaster.core.Blackbox.note("🩺 проверка линии до «${n.name}» ${n.addr}:${n.port} · " +
+                com.zen.blaster.core.NetInfo.line(this@MainActivity))
+            r.lines.forEach { com.zen.blaster.core.Blackbox.note("   $it") }
+            com.zen.blaster.core.Blackbox.note("   ⇒ ${r.verdict}")
+            // Режут адрес, порт, имя, TLS или морозят объём — на этом операторе
+            // нода «сгорела»: сразу в конец каскада (три провала разом).
+            if (r.kind.name in setOf("IP", "PORT", "SNI", "TLS", "VOLUME")) {
+                val ck = com.zen.blaster.core.NetInfo.carrierKey(this@MainActivity)
+                repeat(3) { prefs.rememberCarrierLoss(ck, traitKey(n), lost = true) }
+                com.zen.blaster.core.Blackbox.note("   🔥 «${n.name}» сгорела на этом операторе (${r.kind}) — в конец каскада")
+            }
+            runOnUiThread {
+                r.lines.forEach { log("   $it") }
+                log("🩺 ${r.verdict}")
+                if (manual) toast(r.verdict.take(140))
+            }
         }
     }
 
     // «проверка» — настоящий тест ЧЕРЕЗ поднятый туннель силами самого ядра:
     // не «открыт ли порт», а «доходит ли трафик до заблокированных сайтов».
     private fun probeActive() {
-        if (connState.intValue != 2) { log("⚠️ Проверка работает на поднятом туннеле"); return }
+        // Без туннеля «проверка» — это проверка линии до выбранной ноды:
+        // где именно умирает трафик (LineProbe). Раньше здесь был отказ.
+        if (connState.intValue != 2) {
+            nodes.getOrNull(selected.intValue)?.let { probeLine(it, manual = true) }
+                ?: toast("Сервер не выбран")
+            return
+        }
         if (probeBusy) { log("⏳ Проверка уже идёт"); return }
         probeBusy = true
         log("🔎 Проверяю ответ сервера…")
@@ -1173,13 +1354,21 @@ class MainActivity : ComponentActivity() {
         val want = prefs.hyDownMbps to prefs.hyUpMbps
         if (com.zen.blaster.core.NetInfo.slowMobile(this)) return 0 to 0
         val kbps = com.zen.blaster.core.NetInfo.downKbps(this)
-        if (kbps <= 0) return want                    // система не знает — не выдумываем
+        val mobile = com.zen.blaster.core.NetInfo.snapshot(this).mobile
+        // Система скорость не знает. Здесь стояло «не выдумываем» — и тут же
+        // возвращались 100↓/20↑ из настроек, то есть ровно выдуманное. Журнал
+        // 20.10, Tele2: «Hysteria2 в режиме Brutal: 100↓ / 20↑», нода не
+        // встала. На сотовой связи без замера — BBR: он сам найдёт потолок.
+        // Вслепую заявленный Brutal — это ровный плотный UDP-поток, который
+        // и сам себя топит, и сильнее всего заметен в соте (см. PdpGuard).
+        if (kbps <= 0) return if (mobile) 0 to 0 else want
         // Потолок ставим и на проводе тоже. Заявить 100 Мбит/с на домашнем
         // канале в 68 — это всё та же ложь ядру, просто не смертельная:
         // Brutal будет давить сверх того, что канал уносит, и стабильно
         // терять хвост. Берём с запасом вниз, потому что переоценить канал
-        // в Brutal опаснее, чем недооценить.
-        val cap = (kbps * 4 / 5 / 1000).coerceAtLeast(1)
+        // в Brutal опаснее, чем недооценить. Оценка сотовой сети у Android —
+        // табличная по типу связи и почти всегда завышена: там запас больше.
+        val cap = (kbps * (if (mobile) 3 else 4) / 5 / 1000).coerceAtLeast(1)
         return if (want.first <= cap) want
                else cap to (want.second * cap / want.first).coerceAtLeast(1)
     }
@@ -1401,8 +1590,14 @@ class MainActivity : ComponentActivity() {
                 // сервера отказ Reality: этот сервер его не пустит, сколько ни
                 // жди, — а Xray с теми же ключами проходит за доли секунды.
                 var waited = 0L
+                // Пока ищется адрес ноды, отсчёт стоит: в журнале 20.10 поиск
+                // съел 10.6 с из 20, ядру осталось девять, и рабочую ноду
+                // записали в «не отозвался». Пауза — не больше 12 с.
+                var paused = 0L
                 while (waited < waitMs && !(coreRejected && canFallback && !viaXray)) {
-                    kotlinx.coroutines.delay(250); waited += 250
+                    kotlinx.coroutines.delay(250)
+                    if (com.zen.blaster.core.Resolver.busy() && paused < 12_000L) paused += 250
+                    else waited += 250
                     if (gen != connectAttempt || connState.intValue == 2) break
                 }
                 // КАНАЛ УЖЕ ЖИВОЙ — ДАЁМ ПРОВЕРКАМ ДОЙТИ.
@@ -1467,6 +1662,20 @@ class MainActivity : ComponentActivity() {
                     chainFailedFor = keyOf(n)
                     toggleConnect(force = true, forceXray = forceXray,
                         noFront = noFront, noChain = true)
+                } else if (canFallback && ZenVpnService.channelProven && !rejected) {
+                    // КАНАЛ ЧЕРЕЗ НОДУ ЖИВ — ВТОРОЕ ЯДРО НЕ ПОМОЖЕТ.
+                    //
+                    // Журнал 31.10, «Белые списки #3» (Sirius): Xray поднял
+                    // туннель (прогрев 204 за 320 мс, «канал живой»), но
+                    // YouTube через ноду не ответил — сломан выход сервера, а
+                    // не ядро. Мы всё равно пересаживались на sing-box (его
+                    // сервер вообще не пустил: reality verification failed) и
+                    // теряли ещё полминуты. Сразу к другой ноде.
+                    log("↪ Канал через ноду есть, но сайты через неё не открываются — дело в выходе сервера, беру другую ноду")
+                    com.zen.blaster.core.Blackbox.outcome(false,
+                        "канал через ноду живой, но сайты не отвечают — выход сервера; второе ядро не пробую")
+                    prefs.rememberCarrierLoss(com.zen.blaster.core.NetInfo.carrierKey(this@MainActivity), traitKey(n), lost = true)
+                    sniffRegime()
                 } else if (canFallback) {
                     val other = !viaXray
                     log("↔ ${if (viaXray) "Xray" else "sing-box"} не поднял ноду — пробую " +
@@ -1487,7 +1696,10 @@ class MainActivity : ComponentActivity() {
                     // дело может быть не в ноде. Спрашиваем саму сеть.
                     com.zen.blaster.core.Blackbox.outcome(false,
                         "не поднялось за ${waitMs / 1000} с, второго ядра для этой ноды нет")
+                    prefs.rememberCarrierLoss(com.zen.blaster.core.NetInfo.carrierKey(this@MainActivity), traitKey(n), lost = true)
                     sniffRegime()
+                    // И где именно гибнет трафик до этой ноды — по фактам.
+                    probeLine(n, manual = false)
                 }
             }
         }
@@ -1762,8 +1974,19 @@ class MainActivity : ComponentActivity() {
                 }
             }
         ) { pad ->
-            Box(Modifier.padding(pad).fillMaxSize().background(ZenBg)) {
-                when (tab) { 0 -> HomeTab(); 1 -> SettingsTab(); 2 -> LogsTab() }
+            Column(Modifier.padding(pad).fillMaxSize().background(ZenBg)) {
+                // «Доступно обновление ядер» — на главной, ведёт в Настройки.
+                val offer = coreOffer.value
+                if (tab == 0 && offer.isNotEmpty())
+                    Text("🧩 Доступно обновление ядер: $offer — в Настройках, раздел «Ядра»",
+                        color = ZenCyan, fontSize = 13.sp,
+                        modifier = Modifier.fillMaxWidth()
+                            .background(ZenCyan.copy(alpha = 0.10f))
+                            .clickable { tab = 1 }
+                            .padding(horizontal = 20.dp, vertical = 10.dp))
+                Box(Modifier.weight(1f).fillMaxWidth()) {
+                    when (tab) { 0 -> HomeTab(); 1 -> SettingsTab(); 2 -> LogsTab() }
+                }
             }
         }
         if (showPicker.value) ServerPicker()
@@ -2548,36 +2771,60 @@ class MainActivity : ComponentActivity() {
                 val visible = nodes.mapIndexed { i, n -> i to n }
                     .filter { (_, n) -> showAll || (n.supported() && n.ping < 900 && !n.gone) }
                 val hidden = nodes.size - visible.size
-                Row(
-                    Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                // Заголовок — своей строкой, действия — кнопками под ним.
+                // В одну строку при крупном шрифте системы слово «Серверы»
+                // срезалось до «Серверь» (скриншот 31.10).
+                Text("Серверы", color = Color.White, fontSize = 17.sp, maxLines = 1,
+                    modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 8.dp))
+                // Три разные операции — раньше была одна «обновить», и было
+                // непонятно, что она делает: тянет подписки или мерит.
+                @OptIn(ExperimentalLayoutApi::class)
+                FlowRow(
+                    Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    // Счётчик ушёл строкой ниже: вместе с тремя кнопками
-                    // «Серверы (100)» не помещалось и обрезалось многоточием.
-                    Text("Серверы", color = Color.White, fontSize = 17.sp, maxLines = 1,
-                        softWrap = false, modifier = Modifier.weight(1f).padding(end = 6.dp))
-                    // Три разные операции — раньше была одна «обновить», и было
-                    // непонятно, что она делает: тянет подписки или мерит.
-                    Text("пинг", color = ZenCyan, fontSize = 13.sp, maxLines = 1,
-                        modifier = Modifier.clickable { repingAll() })
-                    Spacer(Modifier.width(12.dp))
-                    Text("проверка", color = ZenCyan, fontSize = 13.sp, maxLines = 1,
-                        modifier = Modifier.clickable { probeActive() })
-                    Spacer(Modifier.width(12.dp))
-                    Text("обновить", color = ZenCyan, fontSize = 13.sp, maxLines = 1,
-                        modifier = Modifier.clickable { loadServers() })
+                    val pd = pingDone.intValue
+                    ActionChip(if (pd >= 0) "пинг $pd/${pingTotal.intValue}" else "пинг") { repingAll() }
+                    ActionChip("проверка") { probeActive() }
+                    ActionChip("обновить") { loadServers() }
                 }
-                Text(
-                    buildString {
-                        append("всего ${visible.size}")
-                        if (hidden > 0 && !showAll) append(" · не отвечают: $hidden — показать")
-                        if (showAll) append(" · показать только рабочие")
-                    },
-                    color = ZenGray, fontSize = 12.sp,
-                    modifier = Modifier
-                        .padding(horizontal = 20.dp, vertical = 2.dp)
-                        .clickable { showAll = !showAll }
-                )
+                // Что можно убрать крестиком разом. Выбранную не трогаем:
+                // убирать сервер, на котором сидишь, — это другое действие.
+                val dead = nodes.filterIndexed { i, n -> i != selected.intValue && removable(n) }
+                val dismissedCount = prefs.dismissedNodes().size
+                // Убрать пачкой — с подтверждением вторым нажатием: одно
+                // случайное касание не должно смести полсписка.
+                var confirmDead by remember { mutableStateOf(false) }
+                LaunchedEffect(confirmDead) {
+                    if (confirmDead) { kotlinx.coroutines.delay(4000); confirmDead = false }
+                }
+                @OptIn(ExperimentalLayoutApi::class)
+                FlowRow(
+                    Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 2.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Text(
+                        buildString {
+                            append("всего ${visible.size}")
+                            if (hidden > 0 && !showAll) append(" · не отвечают: $hidden — показать")
+                            if (showAll) append(" · показать только рабочие")
+                        },
+                        color = ZenGray, fontSize = 12.sp,
+                        modifier = Modifier.clickable { showAll = !showAll }
+                    )
+                    if (dead.isNotEmpty())
+                        Text(if (confirmDead) "✕ точно убрать ${dead.size}? — ещё раз"
+                             else "✕ убрать мёртвые: ${dead.size}",
+                            color = Color(0xFFE0483C), fontSize = 12.sp,
+                            modifier = Modifier.clickable {
+                                if (confirmDead) { confirmDead = false; dismissNodes(dead) }
+                                else confirmDead = true
+                            })
+                    if (dismissedCount > 0)
+                        Text("вернуть убранные: $dismissedCount", color = ZenCyan, fontSize = 12.sp,
+                            modifier = Modifier.clickable { restoreDismissed() })
+                }
                 if (nodes.isEmpty()) {
                     Text("Список пуст. Добавьте подписку или конфиг в Настройках.",
                         color = ZenGray, fontSize = 14.sp,
@@ -2704,12 +2951,16 @@ class MainActivity : ComponentActivity() {
                                         n.wl -> Color(0xFFE87A3A)
                                         else -> ZenGray
                                     },
-                                    fontSize = 12.sp, maxLines = 1
+                                    // Две строки: «нет в свежей выдаче, но
+                                    // отвечает» в одну не влезало и рвалось.
+                                    fontSize = 12.sp, maxLines = 2
                                 )
                             }
                             Text(
                                 when {
-                                    !ok -> "✕"
+                                    // Знак ✕ теперь один — у кнопки «убрать»;
+                                    // в колонке пинга он путал бы.
+                                    !ok -> "—"
                                     // Тильда = цифра приблизительная: сам порт
                                     // QUIC-ноды молчит, и время померено до
                                     // соседнего порта того же сервера. Путь тот
@@ -2724,7 +2975,7 @@ class MainActivity : ComponentActivity() {
                                     // Раньше здесь стояло слово «QUIC»: оно
                                     // ничего не говорило и не менялось никогда,
                                     // сколько бы сервер ни лежал.
-                                    n.ping < 0 && n.silentTries >= Node.SILENT_LIMIT -> "✕ нет"
+                                    n.ping < 0 && n.silentTries >= Node.SILENT_LIMIT -> "нет"
                                     // Промолчала первый раз — это ещё ни о чём:
                                     // бывает от своей же сети. Пробуем дальше.
                                     n.ping < 0 && n.quic() -> "…"
@@ -2742,6 +2993,17 @@ class MainActivity : ComponentActivity() {
                                 },
                                 fontSize = 13.sp
                             )
+                            // Крестик: убрать из списка мёртвую, пропавшую из
+                            // выдачи или неподдерживаемую ноду. Своё касание —
+                            // нажатие по крестику не переключает сервер.
+                            if (!active && removable(n))
+                                Text("✕", color = Color(0xFFE0483C), fontSize = 16.sp,
+                                    modifier = Modifier
+                                        .padding(start = 8.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(0xFFE0483C).copy(alpha = 0.12f))
+                                        .clickable { dismissNodes(listOf(n)) }
+                                        .padding(horizontal = 9.dp, vertical = 3.dp))
                         }
                         HorizontalDivider(color = ZenDivider, thickness = 0.5.dp)
                     }
@@ -4007,6 +4269,59 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // ---------- ЯДРА: «Доступно обновление ядер» ----------
+    //
+    //  Раньше о новых ядрах человек узнавал, только если сам открывал
+    //  Настройки → Ядра и жал «проверить». Теперь проверка идёт тихо, не чаще
+    //  раза в три часа, а найденное горит надписью на главном экране.
+    //  Ставит ядро по-прежнему сам человек: надпись ведёт в Настройки.
+    //  Выкладка на сервер — только после проверки на телефоне (cores-bot.sh).
+    private val coreOffer = mutableStateOf("")
+
+    // Версия ВСТРОЕННОГО Xray — спрашиваем сам бинарник из APK.
+    private fun builtinXrayVersion(): String = try {
+        val bin = java.io.File(applicationInfo.nativeLibraryDir, "libxrayexec.so")
+        val out = ProcessBuilder(bin.absolutePath, "version").redirectErrorStream(true)
+            .start().inputStream.bufferedReader().readText()
+        Regex("Xray ([0-9.]+)").find(out)?.groupValues?.get(1) ?: "?"
+    } catch (_: Throwable) { "?" }
+
+    // Что из каталога новее стоящего сейчас (модуля или встроенного) — по
+    // одному, самому свежему, на каждое ядро.
+    private fun coreOffers(cat: com.zen.blaster.core.CoreModules.Catalog,
+                           builtinXray: String): List<com.zen.blaster.core.CoreModules.Module> {
+        val cm = com.zen.blaster.core.CoreModules
+        val now = mapOf(
+            cm.XRAY to (cm.active(this, cm.XRAY)?.version ?: builtinXray),
+            cm.AWG to (cm.active(this, cm.AWG)?.version ?: com.zen.blaster.core.AmneziaCore.BUILD),
+            cm.AWG_LEGACY to (cm.active(this, cm.AWG_LEGACY)?.version ?: com.zen.blaster.core.AmneziaCore.BUILD_LEGACY))
+        return cat.modules.filter { m -> cm.newer(m.version, now[m.slot] ?: "") }
+            .groupBy { it.slot }
+            .mapNotNull { (_, l) -> l.maxWithOrNull { a, b -> if (cm.newer(a.version, b.version)) 1 else -1 } }
+    }
+
+    private fun offerText(l: List<com.zen.blaster.core.CoreModules.Module>) =
+        l.joinToString(", ") { m ->
+            when (m.slot) {
+                com.zen.blaster.core.CoreModules.XRAY -> "Xray"
+                com.zen.blaster.core.CoreModules.AWG -> "Amnezia"
+                else -> "Amnezia 1.x"
+            } + " " + m.version
+        }
+
+    private fun checkCoresQuietly() {
+        coreOffer.value = prefs.coreOffer
+        if (System.currentTimeMillis() - prefs.lastCoreCheck < 3 * 3600_000L) return
+        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            val cat = com.zen.blaster.core.CoreModules.fetch(this@MainActivity) ?: return@launch
+            prefs.lastCoreCheck = System.currentTimeMillis()
+            val text = offerText(coreOffers(cat, builtinXrayVersion()))
+            prefs.coreOffer = text
+            runOnUiThread { coreOffer.value = text }
+            if (text.isNotEmpty()) com.zen.blaster.core.Blackbox.note("🧩 доступно обновление ядер: $text")
+        }
+    }
+
     // ---------- ЯДРА (модули) ----------
     //
     // Xray и Amnezia обновляются без нового Zen: подписанные модули с нашего
@@ -4023,13 +4338,7 @@ class MainActivity : ComponentActivity() {
         var catalog by remember { mutableStateOf<com.zen.blaster.core.CoreModules.Catalog?>(null) }
         androidx.compose.runtime.LaunchedEffect(Unit) {
             builtinXray = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                // Версия ВСТРОЕННОГО Xray — сам бинарник из APK.
-                try {
-                    val bin = java.io.File(applicationInfo.nativeLibraryDir, "libxrayexec.so")
-                    val out = ProcessBuilder(bin.absolutePath, "version").redirectErrorStream(true)
-                        .start().inputStream.bufferedReader().readText()
-                    Regex("Xray ([0-9.]+)").find(out)?.groupValues?.get(1) ?: "?"
-                } catch (_: Throwable) { "?" }
+                builtinXrayVersion()
             }
         }
         fun line(name: String, slot: String, builtin: String): String {
@@ -4065,12 +4374,9 @@ class MainActivity : ComponentActivity() {
                     catalog = cat
                     if (cat == null) { status = "Источники модулей не ответили или подпись не сошлась"; offers = emptyList(); return@launch }
                     // Предлагаем то, что новее стоящего сейчас (модуля или встроенного).
-                    val now = mapOf(
-                        cm.XRAY to (cm.active(ctx, cm.XRAY)?.version ?: builtinXray),
-                        cm.AWG to (cm.active(ctx, cm.AWG)?.version ?: com.zen.blaster.core.AmneziaCore.BUILD),
-                        cm.AWG_LEGACY to (cm.active(ctx, cm.AWG_LEGACY)?.version ?: com.zen.blaster.core.AmneziaCore.BUILD_LEGACY))
-                    offers = cat.modules.filter { m -> cm.newer(m.version, now[m.slot] ?: "") }
-                        .groupBy { it.slot }.mapNotNull { (_, l) -> l.maxWithOrNull { a, b -> if (cm.newer(a.version, b.version)) 1 else -1 } }
+                    offers = coreOffers(cat, builtinXray)
+                    prefs.lastCoreCheck = System.currentTimeMillis()
+                    prefs.coreOffer = offerText(offers); coreOffer.value = prefs.coreOffer
                     status = if (offers.isEmpty()) "Новее того, что стоит, ничего нет (${cat.modules.size} модулей под ${cm.abi()})"
                              else "Есть обновления: ${offers.size}"
                     log("🧩 Модули ядер: $status")
@@ -4093,7 +4399,12 @@ class MainActivity : ComponentActivity() {
                         status = if (err == null) "Поставлен ${m.core} ${m.version} — заработает при следующем подключении"
                                  else "Не поставился: $err"
                         log("🧩 $status")
-                        if (err == null) { offers = offers - m; recycleAwg(m.slot); tick++ }
+                        if (err == null) {
+                            offers = offers - m; recycleAwg(m.slot); tick++
+                            // Поставил — надпись на главной гаснет (или
+                            // остаётся про оставшиеся ядра).
+                            prefs.coreOffer = offerText(offers); coreOffer.value = prefs.coreOffer
+                        }
                     }
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = ZenCard),

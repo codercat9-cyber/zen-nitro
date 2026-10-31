@@ -225,7 +225,14 @@ object Blackbox {
         if (dup(msg)) return
         coreLines++
         val dt = (System.currentTimeMillis() - start) / 100 / 10.0
-        write("│ +${dt} ⟨ядро⟩ ${plain(msg).take(220)}\n" +
+        // Причина у ядра — в КОНЦЕ строки: «failed to send upload > Get …:
+        // dial tcp: lookup cdn.thriller4ag.com: …». Здесь стояло take(220), и
+        // всё самое важное отрезалось — по журналу было не понять, что
+        // сломалось. Длинную строку держим целиком, а очень длинную — с
+        // головой и хвостом, вырезая середину (там обычно повторы URL).
+        val p = plain(msg)
+        val line = if (p.length <= 900) p else p.take(300) + " … " + p.takeLast(560)
+        write("│ +${dt} ⟨ядро⟩ $line\n" +
             if (coreLines == CORE_LIMIT) "│ … дальше ядро ругается тем же — не пишу\n" else "")
     }
 

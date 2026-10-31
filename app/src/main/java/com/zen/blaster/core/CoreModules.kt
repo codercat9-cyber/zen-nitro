@@ -76,6 +76,7 @@ object CoreModules {
         val sha256: String,
         val minApp: Int,
         val notes: String,
+        val source: String = "",  // откуда качать: у каждого модуля свой источник
     ) {
         val slot: String get() = when {
             core == "awg" && variant == "legacy" -> AWG_LEGACY
@@ -136,7 +137,11 @@ object CoreModules {
 
     fun sources(ctx: Context): List<String> {
         val custom = Prefs(ctx).coresSource.trim()
-        return (listOf(DEFAULT_SOURCE) + listOf(custom).filter { it.startsWith("https://") })
+        // http — только до своей машины (127.0.0.1 через adb reverse — проверка
+        // свежих модулей до выкладки). Подмены это не открывает: манифест
+        // подписан, у каждого файла sha256 — чужое не встанет и по http.
+        val local = custom.startsWith("http://127.0.0.1") || custom.startsWith("http://localhost")
+        return (listOf(DEFAULT_SOURCE) + listOf(custom).filter { it.startsWith("https://") || local })
             .map { if (it.endsWith("/")) it else "$it/" }.distinct()
     }
 
@@ -153,10 +158,17 @@ object CoreModules {
 
     data class Catalog(val source: String, val modules: List<Module>)
 
-    // Первый источник, чей манифест скачался И прошёл проверку подписи.
+    // ВСЕ источники, чьи манифесты скачались И прошли проверку подписи.
     // Неподписанный или битый манифест — как будто источника нет.
+    //
+    // Раньше брался ПЕРВЫЙ ответивший: пока отвечал наш сервер со старым
+    // каталогом, второй источник со свежими ядрами не спрашивался вовсе.
+    // Теперь модули всех источников вместе, у каждого — свой адрес, а
+    // выбор «что новее» делает тот, кто предлагает (coreOffers).
     fun fetch(ctx: Context, onLog: (String) -> Unit = {}): Catalog? {
         val c = http()
+        val all = mutableListOf<Module>()
+        var first: String? = null
         for (src in sources(ctx)) {
             try {
                 val body = c.newCall(req(src + "cores.json")).execute().use {
@@ -171,12 +183,14 @@ object CoreModules {
                     onLog("⛔ Модули ядер: подпись манифеста не сошлась (${host(src)}) — не беру")
                     continue
                 }
-                return Catalog(src, parse(String(body), abi(), com.zen.blaster.BuildConfig.VERSION_CODE))
+                all += parse(String(body), abi(), com.zen.blaster.BuildConfig.VERSION_CODE)
+                    .map { it.copy(source = src) }
+                if (first == null) first = src
             } catch (t: Throwable) {
                 onLog("… модули ядер: ${host(src)} не ответил (${t.message})")
             }
         }
-        return null
+        return first?.let { Catalog(it, all) }
     }
 
     private fun host(u: String) = try { java.net.URI(u).host } catch (_: Exception) { u }
@@ -206,7 +220,7 @@ object CoreModules {
         val tmp = File(dir, "download.tmp")
         try {
             onProgress("Качаю ${m.core} ${m.version}…")
-            http().newCall(req(cat.source + m.file)).execute().use { r ->
+            http().newCall(req(m.source.ifEmpty { cat.source } + m.file)).execute().use { r ->
                 if (!r.isSuccessful) return "сервер ответил HTTP ${r.code}"
                 val md = java.security.MessageDigest.getInstance("SHA-256")
                 var got = 0L

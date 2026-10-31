@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Сборка app/libs/libbox.aar (sing-box 1.14.3) и sing-box для ПК, которым
+# Сборка app/libs/libbox.aar (sing-box — версия в VER ниже) и sing-box для ПК, которым
 # tools/check-configs.sh проверяет конфиги.
 #
 #   native/sbox/build.sh [рабочая папка]     (по умолчанию ~/build/zen-sbox)
@@ -11,7 +11,7 @@
 #     которая одна тянула 210 пакетов (61 → 50 МБ на ABI);
 #   • три ABI, что везёт Zen; API 24 = minSdk.
 set -euo pipefail
-VER=v1.14.3
+VER=v1.14.4
 HERE=$(cd "$(dirname "$0")" && pwd)
 ZEN=$(cd "$HERE/../.." && pwd)
 WORK=${1:-$HOME/build/zen-sbox}
@@ -22,9 +22,16 @@ export ANDROID_HOME=${ANDROID_HOME:-$HOME/Android/Sdk}
 export ANDROID_NDK_HOME=${ANDROID_NDK_HOME:-$ANDROID_HOME/ndk/25.1.8937393}
 
 mkdir -p "$WORK"; cd "$WORK"
-[ -d sing-box ] || git clone --depth 1 --branch $VER https://github.com/SagerNet/sing-box
-cd sing-box
-git apply --check "$HERE/zen-noshell.patch" 2>/dev/null && git apply "$HERE/zen-noshell.patch"
+# Своя папка на каждую версию: раньше папка «sing-box» от прошлой версии
+# оставалась, и смена VER молча собирала старое ядро.
+SRC="sing-box-$VER"
+if [ ! -d "$SRC" ]; then
+  git clone -q --depth 1 --branch $VER https://github.com/SagerNet/sing-box "$SRC"
+  # Патч обязателен: без него в ядро возвращается удалённая консоль с
+  # Tailscale. Не лёг на новую версию — стоп, а не тихая сборка без него.
+  git -C "$SRC" apply "$HERE/zen-noshell.patch" || { echo "⛔ zen-noshell.patch не ложится на $VER — обновите патч"; rm -rf "$SRC"; exit 1; }
+fi
+cd "$SRC"
 go install github.com/sagernet/gomobile/cmd/gomobile@v0.1.12 github.com/sagernet/gomobile/cmd/gobind@v0.1.12
 PATH=$(go env GOPATH)/bin:$PATH
 gomobile init

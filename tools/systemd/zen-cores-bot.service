@@ -5,5 +5,5 @@ After=network-online.target
 [Service]
 Type=oneshot
 # Путь к проекту — поправить, если переехал.
-ExecStart=%h/Рабочий\x20стол/ВПН-ы/zen-android_vibes_20260726_123009/zen-android/tools/cores-bot.sh
+ExecStart=%h/Рабочий\x20стол/ZenNitro/zen-nitro/tools/cores-bot.sh
 Nice=15

@@ -50,6 +50,30 @@ object LocalProbe {
 
     // Клиент, идущий НАПРЯМУЮ, мимо туннеля. Нужен для сравнения: именно так
     // выглядит телефон, если защита отвалится.
+    // ОБЪЁМ ЧЕРЕЗ ТУННЕЛЬ: сколько байт пройдёт, прежде чем встанет.
+    //
+    // Журнал 31.10, «Белые списки #3»: маленькие проверки (204) проходят,
+    // а YouTube молчит; через три минуты та же нода работает. Отличить
+    // заморозку потока на линии (почерк поведенческой блокировки ТСПУ:
+    // первые килобайты идут, дальше тишина) от глухого выхода сервера
+    // (не приходит ничего) можно только по этой цифре.
+    fun volume(): Pair<Long, Boolean> {
+        val c = through().newBuilder()
+            .readTimeout(4, java.util.concurrent.TimeUnit.SECONDS)
+            .callTimeout(15, java.util.concurrent.TimeUnit.SECONDS).build()
+        var total = 0L
+        return try {
+            val req = okhttp3.Request.Builder().url("https://speed.cloudflare.com/__down?bytes=262144").build()
+            c.newCall(req).execute().use { r ->
+                val src = r.body?.source() ?: return 0L to false
+                val sink = okio.Buffer()
+                while (true) { val n = src.read(sink, 8192); if (n < 0) break; total += n; sink.clear() }
+            }
+            total to false
+        } catch (_: java.io.InterruptedIOException) { total to true
+        } catch (_: Exception) { total to (total > 0) }
+    }
+
     private fun direct(): okhttp3.OkHttpClient = okhttp3.OkHttpClient.Builder()
         .proxy(java.net.Proxy.NO_PROXY)
         .connectTimeout(6, java.util.concurrent.TimeUnit.SECONDS)

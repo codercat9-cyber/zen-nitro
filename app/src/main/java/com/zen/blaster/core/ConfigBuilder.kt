@@ -90,7 +90,11 @@ object ConfigBuilder {
         chainViaDpi: Boolean = false
     ): JSONObject {
         // Под бронёй IPv6 принудительно выключен: утечка через него выдаёт туннель.
-        val ds = if (ipv6 && !armor) "ipv6_only" else "ipv4_only"
+        //
+        // Включённый IPv6 — это «можно и IPv6», а не «только IPv6». Здесь
+        // стояло ipv6_only: DNS отдавал одни AAAA-записи, и каждый сайт без
+        // IPv6-адреса (а таких большинство) просто не открывался.
+        val ds = if (ipv6 && !armor) "prefer_ipv4" else "ipv4_only"
         val fp = if (armor) pickFingerprint() else ""
         if (armor) lastFingerprint = fp
         val useVpn = vpnEnabled && n != null
@@ -128,6 +132,17 @@ object ConfigBuilder {
         // Фрагментацию TLS обеспечивает ByeDPI (DPI-щит), поэтому
         // здесь её не дублируем.
             .put(JSONObject().put("ip_is_private", true).put("outbound", "direct"))
+        // IPv6 ВЫКЛЮЧЕН — ЗНАЧИТ ОТКАЗ СРАЗУ, А НЕ ЧЕРЕЗ НОДУ.
+        //
+        // Маршрут ::/0 туннель забирает себе намеренно, иначе IPv6 ушёл бы
+        // мимо него. Но дальше такие соединения ехали на ноду, у сервера
+        // IPv6 нет, и приложение узнавало об этом только по таймауту: в
+        // журнале 3.6 — 485 строк «dial tcp6 [2a00:…]: network is
+        // unreachable» и «i/o timeout» до адресов Google. Адреса IPv6
+        // приложения берут мимо нашего DNS (свой DoH, частный DNS системы).
+        // Отказ сразу (RST / ICMP unreachable) — и они без паузы идут по IPv4.
+        if (ds == "ipv4_only")
+            rules.put(JSONObject().put("ip_version", 6).put("action", "reject"))
         // РАНЬШЕ РУ-домены уходили мимо туннеля ВСЕГДА, даже с выключенной
         // гео-маршрутизацией — из-за этого сайты видели настоящий IP и страну.
         // Теперь это делается только по явному согласию (переключатель в

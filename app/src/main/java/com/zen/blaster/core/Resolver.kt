@@ -123,9 +123,48 @@ object Resolver {
 
         cache[host]?.let { if (System.currentTimeMillis() < it.until) return it.ip }
 
-        val (ip, trusted) = resolveUncached(host)
-        if (ip != null && trusted) cache[host] = Hit(ip, System.currentTimeMillis() + TTL)
-        return ip
+        inFlight.incrementAndGet()
+        try {
+            val (ip, trusted) = resolveUncached(host)
+            if (ip != null && trusted) {
+                cache[host] = Hit(ip, System.currentTimeMillis() + TTL)
+                remember(host, ip)
+            }
+            return ip
+        } finally { inFlight.decrementAndGet() }
+    }
+
+    // Идёт ли сейчас поиск адреса. Сторож подключения на это время ставит
+    // свой отсчёт на паузу: поиск — ещё не подключение.
+    private val inFlight = java.util.concurrent.atomic.AtomicInteger(0)
+    fun busy(): Boolean = inFlight.get() > 0
+
+    // ------------------------------------------- последний проверенный адрес
+    //
+    //  Журнал 20.10: «+10.6 🔎 hy2at… → адрес», и только потом «sing-box
+    //  запущен» — из двадцати секунд на подъём больше половины ушло на поиск
+    //  адреса. DoH на LTE молчал свои 6 секунд, потом отвечал системный
+    //  резолвер оператора. Так же падали CDN-ноды: «lookup cdn.thriller4ag.com».
+    //
+    //  Адрес сервера меняется редко, а спрашиваем мы его на каждом подъёме.
+    //  Поэтому каждый ответ DoH (только ему верим) кладём на диск, и когда
+    //  DoH не отвечает быстро, подключаемся по последнему проверенному адресу.
+    //  Опоздавший ответ DoH всё равно освежит запись — к следующему разу.
+    private const val KNOWN = "resolver_known"
+    private const val FAST_MS = 2_500L
+    private val bg = java.util.concurrent.Executors.newCachedThreadPool { r ->
+        Thread(r, "zen-resolve").apply { isDaemon = true }
+    }
+
+    private fun known(host: String): String? = try {
+        app?.getSharedPreferences(KNOWN, 0)?.getString(host, null)
+    } catch (_: Throwable) { null }
+
+    private fun remember(host: String, ip: String) {
+        try {
+            val sp = app?.getSharedPreferences(KNOWN, 0) ?: return
+            if (sp.getString(host, null) != ip) sp.edit().putString(host, ip).apply()
+        } catch (_: Throwable) {}
     }
 
     // Второе значение — пришёл ли ответ по шифрованному каналу.
@@ -136,20 +175,44 @@ object Resolver {
             return parallelDoh(host) to true
         }
 
-        // DoH недавно оказался мёртв — не тратим время, сразу к системному.
-        // Он в такие дни как раз и работает: операторы режут DoH первым делом,
-        // а свой резолвер оставляют, иначе у людей не откроются и разрешённые
-        // сайты.
+        val last = known(host)
+
+        // DoH недавно оказался мёртв — не тратим время, сразу к проверенному
+        // адресу, а за ним к системному. Он в такие дни как раз и работает:
+        // операторы режут DoH первым делом, а свой резолвер оставляют, иначе
+        // у людей не откроются и разрешённые сайты.
         if (System.currentTimeMillis() < dohDeadUntil) {
+            last?.let { return it to false }
             system(host)?.let { return it to false }
             return parallelDoh(host) to true
         }
 
-        parallelDoh(host)?.let { return it to true }
+        val doh = java.util.concurrent.CompletableFuture.supplyAsync({ parallelDoh(host) }, bg)
+        doh.thenAccept { ip ->
+            if (ip != null) {
+                cache[host] = Hit(ip, System.currentTimeMillis() + TTL)
+                remember(host, ip)
+            }
+        }
+        try { doh.get(FAST_MS, java.util.concurrent.TimeUnit.MILLISECONDS)?.let { return it to true } }
+        catch (_: Throwable) {}
 
+        // DoH быстро не ответил. Проверенный адрес с диска — сразу.
+        last?.let { return it to false }
+
+        // Адреса на диске нет: кто первый — DoH или резолвер оператора.
+        // Общий срок прежний: шесть секунд DoH, как и было до этой правки.
+        val sys = java.util.concurrent.CompletableFuture.supplyAsync({ system(host) }, bg)
+        val deadline = System.currentTimeMillis() + 6_000L - FAST_MS
+        while (System.currentTimeMillis() < deadline) {
+            if (doh.isDone) doh.getNow(null)?.let { return it to true }
+            if (sys.isDone) sys.getNow(null)?.let { return it to false }
+            if (doh.isDone && sys.isDone) break
+            Thread.sleep(50)
+        }
         // Ни один DoH не ответил — запоминаем это на минуту и живём системным.
-        dohDeadUntil = System.currentTimeMillis() + 60_000
-        return system(host) to false
+        if (!doh.isDone || doh.getNow(null) == null) dohDeadUntil = System.currentTimeMillis() + 60_000
+        return (if (sys.isDone) sys.getNow(null) else null) to false
     }
 
     // ВСЕ резолверы разом, а не по очереди.

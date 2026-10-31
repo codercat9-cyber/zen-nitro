@@ -212,6 +212,17 @@ class Prefs(context: Context) {
         sp.edit().putString("nodeCache", arr.toString()).apply()
     }
 
+    // Ноды, убранные крестиком. Ключ — «подписка|адрес:порт»: по нему убранная
+    // не возвращается со следующим «обновить», даже если панель её ещё отдаёт.
+    // Сменит провайдер ей адрес — это уже другая нода, она придёт заново.
+    fun dismissedNodes(): Set<String> = sp.getStringSet("dismissedNodes", emptySet()) ?: emptySet()
+
+    fun dismissNodes(keys: Collection<String>) {
+        sp.edit().putStringSet("dismissedNodes", dismissedNodes() + keys).apply()
+    }
+
+    fun clearDismissed() { sp.edit().remove("dismissedNodes").apply() }
+
     // Ссылки на отдельные серверы, добавленные вручную (vless://, hy2://…).
     fun manualLinks(): List<String> =
         sp.getStringSet("manualLinks", emptySet())?.toList()?.sorted() ?: emptyList()
@@ -361,6 +372,16 @@ class Prefs(context: Context) {
     // Когда в последний раз мерили пинг всего списка. Полный замер — не
     // чаще раза в полчаса; переживает перезапуск, иначе каждое открытие
     // приложения снова запускало бы веер по двум сотням серверов.
+    // Тихая проверка модулей ядер: когда была и что нашла («Xray 26.10.29»).
+    // Найденное держим и между запусками — по нему горит надпись на главной.
+    var lastCoreCheck: Long
+        get() = sp.getLong("lastCoreCheck", 0L)
+        set(v) = sp.edit().putLong("lastCoreCheck", v).apply()
+
+    var coreOffer: String
+        get() = sp.getString("coreOffer", "") ?: ""
+        set(v) = sp.edit().putString("coreOffer", v).apply()
+
     var lastPingAll: Long
         get() = sp.getLong("lastPingAll", 0L)
         set(v) = sp.edit().putLong("lastPingAll", v).apply()
@@ -445,6 +466,28 @@ class Prefs(context: Context) {
             }
             root.put(carrier, o)
             sp.edit().putString("carrierWins", root.toString()).apply()
+        } catch (_: Throwable) {}
+    }
+
+    // ПАМЯТЬ ПРОВАЛОВ ПО ОПЕРАТОРУ — первый шаг «змеи».
+    //
+    //  Удачи мы помнили, провалы — нет: нода, которая на этом операторе
+    //  валится раз за разом, снова шла в каскад наравне со всеми. Здесь —
+    //  сколько раз ПОДРЯД нода не поднялась на этой сети; удача обнуляет.
+    fun carrierLosses(carrier: String): Map<String, Int> = try {
+        val o = JSONObject(sp.getString("carrierLosses", "{}") ?: "{}").optJSONObject(carrier)
+        o?.keys()?.asSequence()?.associateWith { o.optInt(it) } ?: emptyMap()
+    } catch (_: Throwable) { emptyMap() }
+
+    fun rememberCarrierLoss(carrier: String, key: String, lost: Boolean) {
+        if (carrier.isEmpty() || key.isEmpty()) return
+        try {
+            val root = JSONObject(sp.getString("carrierLosses", "{}") ?: "{}")
+            val o = root.optJSONObject(carrier) ?: JSONObject()
+            if (lost) o.put(key, o.optInt(key) + 1) else o.remove(key)
+            if (o.length() > 80) o.keys().asSequence().firstOrNull()?.let { o.remove(it) }
+            root.put(carrier, o)
+            sp.edit().putString("carrierLosses", root.toString()).apply()
         } catch (_: Throwable) {}
     }
 

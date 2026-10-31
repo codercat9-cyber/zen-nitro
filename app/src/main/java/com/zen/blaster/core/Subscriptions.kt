@@ -656,8 +656,10 @@ object Subscriptions {
     const val PING_HOLD = 60 * 60_000L
 
     // Перемерить задержку по уже загруженному списку — без похода за подписками.
-    suspend fun reping(nodes: List<Node>, gentle: Boolean = false) =
-        withContext(Dispatchers.IO) { pingAll(nodes, gentle) }
+    // onEach зовётся после КАЖДОЙ ноды, с потока IO: по нему список показывает
+    // цифры по мере замера, а не одной пачкой через минуту.
+    suspend fun reping(nodes: List<Node>, gentle: Boolean = false, onEach: ((Node) -> Unit)? = null) =
+        withContext(Dispatchers.IO) { pingAll(nodes, gentle, onEach) }
 
     // ЩАДЯЩИЙ РЕЖИМ — ДЛЯ МОБИЛЬНОЙ СЕТИ.
     //
@@ -686,7 +688,8 @@ object Subscriptions {
                else InetSocketAddress(host, port)
     }
 
-    private suspend fun pingAll(nodes: List<Node>, gentle: Boolean = false) = coroutineScope {
+    private suspend fun pingAll(nodes: List<Node>, gentle: Boolean = false,
+                                onEach: ((Node) -> Unit)? = null) = coroutineScope {
         val gate = Semaphore(if (gentle) 8 else 64)
         val wait = if (gentle) 1200 else 2000
         nodes.map { n ->
@@ -728,6 +731,7 @@ object Subscriptions {
                 // Так не выглядят случайно падающие серверы, так выглядит
                 // негодный способ измерения. Красный крест по нему не ставим.
                 if (n.quic()) { if (ms > 0) n.silentTries = 0 else if (!gentle) n.silentTries++ }
+                onEach?.invoke(n)
                 ms
             }
         }.awaitAll()

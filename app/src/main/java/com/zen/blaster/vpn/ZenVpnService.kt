@@ -1057,6 +1057,52 @@ class ZenVpnService : VpnService(), PlatformInterface {
         }
     }
 
+    // ЗАЛИПАНИЕ КАНАЛА — СНАЧАЛА ВЫЯСНИТЬ, НА КАКОМ УРОВНЕ РЕЖУТ.
+    //
+    //  Permanent packet drop бывает и с TCP: ТСПУ молча выбрасывает пакеты
+    //  потока, порта, адреса или имени. Слепое переподключение помогает
+    //  только при дропе потока; при «сгоревшем» адресе оно крутится впустую.
+    //  Проверка линии по данным из конфига — в журнал, параллельно с
+    //  переподключением (его не задерживаем). Не чаще раза в 5 минут.
+    @Volatile private var lastLineProbe = 0L
+    private class LineTarget(val host: String, val port: Int, val sni: String, val udp: Boolean, val tls: Boolean)
+
+    private fun lineTarget(cfg: String, xray: String?): LineTarget? = try {
+        val outs = org.json.JSONObject(cfg).optJSONArray("outbounds")
+        var o: org.json.JSONObject? = null
+        for (i in 0 until (outs?.length() ?: 0)) {
+            val x = outs?.optJSONObject(i)
+            if (x?.optString("tag") == "proxy") { o = x; break }
+        }
+        if (o != null && o.optString("type") != "socks") {
+            val tls = o.optJSONObject("tls")
+            LineTarget(o.optString("server"), o.optInt("server_port"), tls?.optString("server_name").orEmpty(),
+                o.optString("type") in setOf("hysteria2", "tuic"), tls?.optBoolean("enabled") == true)
+        } else if (xray != null) {
+            val x = org.json.JSONObject(xray).getJSONArray("outbounds").getJSONObject(0)
+            val v = x.getJSONObject("settings").getJSONArray("vnext").getJSONObject(0)
+            val ss = x.optJSONObject("streamSettings")
+            val sec = ss?.optString("security").orEmpty()
+            val sni = (ss?.optJSONObject("realitySettings") ?: ss?.optJSONObject("tlsSettings"))
+                ?.optString("serverName").orEmpty()
+            LineTarget(v.getString("address"), v.getInt("port"), sni, false, sec == "tls" || sec == "reality")
+        } else null
+    } catch (_: Throwable) { null }
+
+    private fun probeLineFromConfig(cfg: String, xray: String?) {
+        val now = System.currentTimeMillis()
+        if (now - lastLineProbe < 5 * 60_000L) return
+        val t = lineTarget(cfg, xray) ?: return
+        if (t.host.isEmpty() || t.port <= 0) return
+        lastLineProbe = now
+        kotlin.concurrent.thread(name = "zen-lineprobe", isDaemon = true) {
+            val r = com.zen.blaster.core.LineProbe.runRaw(t.host, t.port, t.sni, t.udp, t.tls)
+            com.zen.blaster.core.Blackbox.note("🩺 канал залип — проверка линии до ${t.host}:${t.port}")
+            r.lines.forEach { com.zen.blaster.core.Blackbox.note("   $it") }
+            com.zen.blaster.core.Blackbox.note("   ⇒ ${r.verdict}")
+        }
+    }
+
     private fun reconnect() {
         val prefs = com.zen.blaster.core.Prefs(this)
         // СБРОС КЕША АДРЕСОВ ПРИ ПЕРЕПОДКЛЮЧЕНИИ.
@@ -1117,6 +1163,7 @@ class ZenVpnService : VpnService(), PlatformInterface {
         val dpi = prefs.lastDpi
         val strat = prefs.dpiStrategy
         xrayConfig = prefs.lastXray.ifEmpty { null }
+        probeLineFromConfig(cfg, xrayConfig)
 
         kotlin.concurrent.thread(name = "zen-reconnect", isDaemon = true) {
             // Гасим всё старое и держим паузу: сети нужно время встать.
@@ -1220,6 +1267,20 @@ class ZenVpnService : VpnService(), PlatformInterface {
         } else {
             say("⚠️ Канал есть, но YouTube не ответил — смените сервер или стратегию DPI.")
             Stats.stage.value = "Канал есть, обход под вопросом"
+            // Сколько пройдёт ЧЕРЕЗ туннель, прежде чем встанет: по этой
+            // цифре отличаем заморозку потока на линии от глухого выхода.
+            if (alive(gen)) {
+                val (b, stalled) = com.zen.blaster.core.LocalProbe.volume()
+                val kb = b / 1024
+                say(when {
+                    b == 0L -> "🩺 Через туннель не пришло ни байта — не везёт выход сервера"
+                    stalled && kb < 64 -> "🩺 Через туннель пришло $kb КБ, потом тишина — " +
+                        "поток заморозили на линии (почерк поведенческой блокировки), сервер отвечал"
+                    stalled -> "🩺 Через туннель пришло $kb КБ, потом тишина"
+                    else -> "🩺 Через туннель $kb КБ прошли без остановки — канал везёт, " +
+                        "не отвечает именно YouTube на выходе сервера"
+                })
+            }
         }
         Thread.sleep(500)
 
@@ -1343,7 +1404,7 @@ class ZenVpnService : VpnService(), PlatformInterface {
     } catch (_: Throwable) { -1 }
 
     // ---------------------------------------------------------- PlatformInterface
-    // Контракт libbox 1.14 (27 методов). Сверка: javap -cp classes.jar
+    // Контракт libbox 1.14.4 (26 методов). Сверка: javap -cp classes.jar
     // io.nekohasekai.libbox.PlatformInterface. SSH, Tailscale, мосты и
     // уведомления ядра нам не нужны — честно отказываем.
 
@@ -1390,7 +1451,7 @@ class ZenVpnService : VpnService(), PlatformInterface {
     // Защита исходящего сокета ядра от зацикливания в туннеле.
     override fun autoDetectInterfaceControl(fd: Int) { protect(fd) }
     override fun usePlatformAutoDetectInterfaceControl(): Boolean = true
-    override fun useProcFS(): Boolean = false
+    // useProcFS() убран из PlatformInterface в libbox 1.14.4 (сверка javap 31.10.2026).
     override fun underNetworkExtension(): Boolean = false
     override fun includeAllNetworks(): Boolean = false
     override fun clearDNSCache() {}
@@ -1548,6 +1609,7 @@ class ZenVpnService : VpnService(), PlatformInterface {
                 try { listener.updateDefaultInterface("", -1, false, false) } catch (_: Exception) {}
             }
             @Volatile var currentNet: Network? = null
+            @Volatile var lastNet: Network? = null
             private fun report(network: Network, lp: LinkProperties?) {
                 val name = lp?.interfaceName ?: return
                 if (name.startsWith("tun")) return          // это наш же туннель — не годится
@@ -1562,12 +1624,25 @@ class ZenVpnService : VpnService(), PlatformInterface {
                 // не сбрасывает: Hysteria2 висит на мёртвом QUIC до тайм-аута,
                 // для человека — «лаги» на полминуты и дольше. Сбрасываем сами.
                 val renewed = currentNet != null && currentNet != network && name == current
+                // ПЕРЕХОД LTE ↔ Wi-Fi — ТОЖЕ СБРОС.
+                //
+                // Сбрасывали только новую сессию на том же интерфейсе. А при
+                // переходе между сетями сначала приходит onLost, он обнуляет
+                // current и currentNet — и следующая сеть сброса не получала:
+                // старые соединения висели на ушедшем интерфейсе до таймаута
+                // («network is unreachable», 70 раз в журнале 3.6). lastNet
+                // при потере сети не обнуляется — по нему смена и видна.
+                val switched = !renewed && lastNet != null && lastNet != network
                 currentNet = network
+                lastNet = network
                 current = name
                 try { listener.updateDefaultInterface(name, idx, false, false) } catch (_: Exception) {}
                 if (renewed) {
                     boxService?.resetNetwork()
                     com.zen.blaster.core.Blackbox.note("♻️ Новая сессия данных на $name — сбросил соединения ядра")
+                } else if (switched) {
+                    boxService?.resetNetwork()
+                    com.zen.blaster.core.Blackbox.note("♻️ Сеть сменилась ($name) — сбросил соединения ядра")
                 }
             }
         }
