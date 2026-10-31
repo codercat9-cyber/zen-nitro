@@ -19,7 +19,7 @@ APK по архитектурам — в `app/build/outputs/apk/release/`.
 
 ## Ядро sing-box (`app/libs/libbox.aar`)
 
-В проекте **sing-box 1.14.3**. Запуск — через `CommandServer` (см.
+В проекте **sing-box 1.14.4**. Запуск — через `CommandServer` (см.
 `vpn/BoxCore.kt`), конфиг — в формате 1.14 (`core/ConfigBuilder.kt`);
 сохранённые конфиги старого вида переводит `core/SingBoxCompat.kt`.
 
@@ -31,7 +31,7 @@ APK по архитектурам — в `app/build/outputs/apk/release/`.
 native/sbox/build.sh
 ```
 
-Скрипт сам скачает sing-box 1.14.3, наложит `native/sbox/zen-noshell.patch`
+Скрипт сам скачает sing-box 1.14.4, наложит `native/sbox/zen-noshell.patch`
 (отключает удалённую консоль — она одна тянула Tailscale, 210 пакетов),
 соберёт `app/libs/libbox.aar` и `build/sing-box-check` для проверки конфигов.
 
