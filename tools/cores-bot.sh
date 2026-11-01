@@ -84,7 +84,7 @@ else
   SRC="$WORK/Xray-core-$XR"
   [ -d "$SRC" ] || git clone -q --depth 1 --branch "$XR" https://github.com/XTLS/Xray-core "$SRC"
   ( cd "$SRC" && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$WORK/xray-check-$XR" ./main )
-  if ! XRAY="$WORK/xray-check-$XR" "$ZEN/tools/check-configs.sh"; then
+  if ! XRAY="$WORK/xray-check-$XR" XRAY_MODULE=1 "$ZEN/tools/check-configs.sh"; then
     echo "⛔ Xray $XR не принял конфиги Zen — модули НЕ выкладываю"
     notify-send "ZEN NITRO: Xray $XR не принял наши конфиги" \
       "Новое ядро людям не идёт — нужна правка клиента. Журнал: $LOG" 2>/dev/null || true

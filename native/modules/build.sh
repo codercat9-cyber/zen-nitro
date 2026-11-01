@@ -37,6 +37,9 @@ ABIS="arm64-v8a:arm64:aarch64-linux-android24 armeabi-v7a:arm:armv7a-linux-andro
 API_XRAY=1      # «run -c», «version»
 API_AWG=2       # + awgRebind (Zen 3.5)
 MIN_APP=28      # первая сборка Zen, которая умеет модули
+# Xray 26.10.29+ не пускает VLESS без TLS до IP; такие ноды на встроенное ядро
+# отдаёт только Zen 3.7.2 (код 31, XrayEngine.bareVless). Старым — не давать.
+MIN_APP_XRAY=31
 
 [ -f "$KEY" ] || { echo "нет ключа подписи: $KEY"; exit 1; }
 mkdir -p "$OUT" "$WORK"
@@ -72,7 +75,7 @@ for A in $ABIS; do
 done
 
 # ---------------------------------------------------------------- манифест
-python3 - "$OUT" "$XV" "$AWG_TAG" "$LEG_TAG" "$API_XRAY" "$API_AWG" "$MIN_APP" <<'PY'
+MIN_APP_XRAY=$MIN_APP_XRAY python3 - "$OUT" "$XV" "$AWG_TAG" "$LEG_TAG" "$API_XRAY" "$API_AWG" "$MIN_APP" <<'PY'
 import hashlib, json, os, sys, datetime
 out, xv, awg, leg, api_x, api_a, min_app = sys.argv[1:8]
 mods = []
@@ -91,7 +94,9 @@ for f in sorted(os.listdir(out)):
         continue
     h = hashlib.sha256(open(p, "rb").read()).hexdigest()
     mods.append(dict(core=core, variant=variant, version=ver, api=api, abi=abi, file=f,
-                     size=os.path.getsize(p), sha256=h, minApp=int(min_app), notes=""))
+                     size=os.path.getsize(p), sha256=h,
+                     minApp=int(os.environ.get("MIN_APP_XRAY", min_app)) if core == "xray" else int(min_app),
+                     notes=""))
 m = dict(schema=1, issued=datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
          modules=mods)
 open(os.path.join(out, "cores.json"), "w").write(json.dumps(m, ensure_ascii=False, indent=1) + "\n")

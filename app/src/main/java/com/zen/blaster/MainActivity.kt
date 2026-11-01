@@ -252,7 +252,7 @@ class MainActivity : ComponentActivity() {
     private fun serverKey(n: Node): String = listOf(
         n.type, n.transport, "${n.addr}:${n.port}", n.uuid, n.auth, n.password, n.method,
         n.encryption, n.sni, n.pbk, n.sid, n.flow, n.path, n.host, n.serviceName, n.alpn,
-        n.security, n.fp, n.obfs, n.obfsPw, n.mode, n.extra, n.hopPorts, n.seed, n.headerType,
+        n.security, n.fp, n.obfs, n.obfsPw, n.mode, n.extra, n.fm, n.hopPorts, n.seed, n.headerType,
         n.alterId.toString(), n.insecure.toString(), n.cc
     ).joinToString("|")
 
@@ -3327,10 +3327,30 @@ class MainActivity : ComponentActivity() {
                     drawCircle(ringColor, r, center, style = Stroke(w))
                 }
             }
+            // ЧЕСТНОЕ «ПОДКЛЮЧЕНО».
+            //
+            // Служба говорит «туннель поднят» — но сторож мог в это время
+            // переподключаться, а нода — не принимать соединение. 01.11.2026,
+            // Realme: весь день на кольце горело «Подключено» при 0 Б/с и
+            // 1989 возвратах. Стадия сторожа — в Stats.stage, по ней и судим.
+            val stage by com.zen.blaster.core.Stats.stage.collectAsState()
+            val dead = state == 2 && stage.startsWith("Нода не принимает")
+            val shaky = state == 2 && !dead && (stage.startsWith("Переподключаюсь") ||
+                stage.startsWith("Поднимаю ядро") || stage.startsWith("Проверяю канал"))
             Text(
-                when (state) { 2 -> "Подключено"; 1 -> "Подключение…"; else -> "Подключиться" },
-                color = if (state == 2) ringColor else Color.White,
-                fontWeight = FontWeight.Normal, fontSize = 26.sp
+                when {
+                    dead -> "Нет связи"
+                    shaky -> "Переподключаюсь…"
+                    state == 2 -> "Подключено"
+                    state == 1 -> "Подключение…"
+                    else -> "Подключиться"
+                },
+                color = when {
+                    dead || shaky -> Color(0xFFE87A3A)
+                    state == 2 -> ringColor
+                    else -> Color.White
+                },
+                fontWeight = FontWeight.Normal, fontSize = if (shaky) 22.sp else 26.sp
             )
         }
     }

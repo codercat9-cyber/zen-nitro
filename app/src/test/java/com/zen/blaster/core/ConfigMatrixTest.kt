@@ -139,6 +139,10 @@ class ConfigMatrixTest {
                 path = "/ws", host = "h.example.com", sni = "h.example.com", insecure = true),
             Node("VLESS", "wl-xhttp", "203.0.113.25", 443, uuid = uuid, transport = "xhttp",
                 path = "/", host = "wl.example.com", sni = "wl.example.com").apply { wl = true },
+            // Finalmask (параметр fm): нарезка приветствия TLS поверх Reality.
+            Node("VLESS", "reality-finalmask", "203.0.113.26", 443, uuid = uuid, sni = "www.microsoft.com",
+                pbk = pbk, sid = "ab12", security = "reality", flow = "xtls-rprx-vision",
+                fm = """{"tcp":[{"type":"fragment","settings":{"packets":"tlshello","lengths":["3-5","6-8"],"delays":["10-20"]}}]}"""),
         )
         for (n in x) {
             for ((mode, cfg) in mapOf(

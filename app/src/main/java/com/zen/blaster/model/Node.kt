@@ -29,6 +29,7 @@ data class Node(
     val cc: String = "bbr",           // TUIC congestion control
     val mode: String = "",            // XHTTP: auto|packet-up|stream-up|stream-one
     val extra: String = "",           // XHTTP: сырой JSON (xmux, scMax*, xPaddingBytes)
+    val fm: String = "",              // Xray Finalmask: сырой JSON {tcp:[…], udp:[…]} из параметра fm
     // Порт-хоппинг Hysteria2: «20000-50000» или «443,20000-50000». Нода
     // прыгает по диапазону, чтобы её не отсекли по одному номеру порта.
     val hopPorts: String = "",
@@ -147,7 +148,7 @@ data class Node(
         .put("transport", transport).put("path", path).put("host", host)
         .put("serviceName", serviceName).put("alpn", alpn).put("security", security)
         .put("fp", fp).put("obfs", obfs).put("obfsPw", obfsPw).put("cc", cc)
-        .put("mode", mode).put("extra", extra).put("seed", seed).put("hopPorts", hopPorts)
+        .put("mode", mode).put("extra", extra).put("fm", fm).put("seed", seed).put("hopPorts", hopPorts)
         .put("headerType", headerType).put("alterId", alterId).put("insecure", insecure)
         .put("sub", sub).put("wl", wl).put("ping", ping)
         .put("pingExact", pingExact).put("pingAt", pingAt).put("gone", gone).put("goneAt", goneAt)
@@ -172,7 +173,7 @@ data class Node(
             security = o.optString("security", "tls"), fp = o.optString("fp"),
             obfs = o.optString("obfs"), obfsPw = o.optString("obfsPw"),
             cc = o.optString("cc", "bbr"), mode = o.optString("mode"),
-            extra = o.optString("extra"), seed = o.optString("seed"),
+            extra = o.optString("extra"), fm = o.optString("fm"), seed = o.optString("seed"),
             hopPorts = o.optString("hopPorts"),
             headerType = o.optString("headerType"), alterId = o.optInt("alterId"), insecure = o.optBoolean("insecure"),
             sub = o.optString("sub"), wl = o.optBoolean("wl"), ping = o.optInt("ping", -1),

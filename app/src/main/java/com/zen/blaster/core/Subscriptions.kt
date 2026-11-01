@@ -570,6 +570,9 @@ object Subscriptions {
             // XHTTP-специфика: без mode и extra (xmux, scMax*, xPaddingBytes)
             // сервер отвечает 400/таймаутом — параметры должны совпасть точно.
             mode = p["mode"] ?: "", extra = p["extra"] ?: "",
+            // Finalmask (Xray 26.3+): фрагментация, шум, свои заголовки —
+            // JSON в параметре fm, как extra у XHTTP. Только ядро Xray.
+            fm = p["fm"] ?: "",
             seed = p["seed"] ?: "", headerType = p["headerType"] ?: "",
             insecure = truthy(p["allowInsecure"]) || truthy(p["insecure"]))
     }

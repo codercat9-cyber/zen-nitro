@@ -220,10 +220,12 @@ class ZenVpnService : VpnService(), PlatformInterface {
 
     private fun catchCertMismatch(line: String) {
         if (!line.contains("certificate is valid for")) return
-        if (!(line.contains("dns:") || line.contains("exchange failed") || line.contains("process packet"))) {
-            certHit = true
-            certReal = line.substringAfter("certificate is valid for ").substringBefore(',').take(60).trim()
-            certWant = Regex("""not ([^\s,"]+)""").find(line)?.groupValues?.get(1) ?: Stats.server.value
+        if (!com.zen.blaster.core.CertMismatch.isResolver(line)) {
+            com.zen.blaster.core.CertMismatch.parse(line)?.let { h ->
+                certHit = true
+                certReal = h.real
+                certWant = h.want ?: Stats.server.value
+            }
         }
         if (certSaid) return
         // Ошибка сертификата DNS-РЕЗОЛВЕРА — не беда ноды. 14.10.2026 с
@@ -240,7 +242,7 @@ class ZenVpnService : VpnService(), PlatformInterface {
         // Чьё имя ждали — из «…, not имя». Раньше искали «Post "https://», а
         // его в журнале 1.14 нет: substringAfter возвращал всю строку, и в
         // журнале выходило «подписка ведёт на ERROR[0001] …».
-        val want = Regex("""not ([^\s,"]+)""").find(line)?.groupValues?.get(1) ?: Stats.server.value
+        val want = com.zen.blaster.core.CertMismatch.parse(line)?.want ?: Stats.server.value
         say("🔐 Сервер представляется как $real, а в подписке имя $want —")
         say("   сервер это имя не принимает. Чаще всего подписка устарела:")
         say("   обновите её. Для обычного TLS снимаю проверку имени.")

@@ -96,7 +96,7 @@ object XrayEngine {
     // вовсе, поэтому такую ноду он поднять не сможет ни при каком транспорте.
     fun handles(n: Node): Boolean =
         n.type == "VLESS" &&
-        (n.transport.lowercase() in XRAY_ONLY || n.encryption.isNotEmpty())
+        (n.transport.lowercase() in XRAY_ONLY || n.encryption.isNotEmpty() || n.fm.isNotEmpty())
 
     // Транспорты, которые умеют ОБА ядра.
     //
@@ -146,7 +146,28 @@ object XrayEngine {
 
     // Поднимает Xray с готовым конфигом (JSON-строка). Возвращает true, если
     // процесс жив и SOCKS реально принимает соединения.
+    // VLESS без TLS и без шифрования. Xray 26.10.29+ такой выход до публичного
+    // IP запрещает уже при старте («vless without TLS or other encryption is
+    // prohibited unless the server address is a private IP or domain»), а мы
+    // ещё и подставляем IP вместо имени (resolveServer). Такие ноды всегда
+    // отдаём встроенному ядру, остальные — модулю. Иначе из-за пары нод mKCP
+    // новое ядро нельзя было бы выпускать вовсе (робот поймал 31.10.2026).
+    fun bareVless(configJson: String): Boolean = try {
+        val o = JSONObject(configJson).getJSONArray("outbounds").getJSONObject(0)
+        if (o.optString("protocol") != "vless") false else {
+            val sec = o.optJSONObject("streamSettings")?.optString("security").orEmpty()
+            val enc = o.optJSONObject("settings")?.optJSONArray("vnext")?.optJSONObject(0)
+                ?.optJSONArray("users")?.optJSONObject(0)?.optString("encryption").orEmpty()
+            (sec.isEmpty() || sec == "none") && (enc.isEmpty() || enc == "none")
+        }
+    } catch (_: Throwable) { false }
+
     fun start(ctx: Context, configJson: String, onLog: (String) -> Unit): Boolean {
+        if (CoreModules.active(ctx, CoreModules.XRAY) != null && bareVless(configJson)) {
+            onLog("🧩 VLESS без TLS — беру встроенное ядро Xray: новые модули такое до IP не пускают")
+            forceBuiltin = true
+            return try { startOnce(ctx, configJson, onLog) } finally { forceBuiltin = false }
+        }
         val ok = startOnce(ctx, configJson, onLog)
         if (!moduleInUse) return ok
         if (ok) { CoreModules.report(ctx, CoreModules.XRAY, true); return true }
@@ -520,6 +541,12 @@ object XrayEngine {
                 JSONObject().put("address", n.addr).put("port", n.port)
                     .put("users", JSONArray().put(user)))))
             .put("streamSettings", stream)
+
+        // FINALMASK (Xray 26.3+) — маска поверх транспорта: нарезка
+        // приветствия, шум в UDP, свои заголовки. Провайдер задаёт её в
+        // ссылке (fm=…), мы кладём как есть: параметры должны совпасть с
+        // сервером. Битый JSON — без маски, но нода не ломается.
+        if (n.fm.isNotEmpty()) try { stream.put("finalmask", JSONObject(n.fm)) } catch (_: Throwable) {}
 
         // Мультиплексирование — восемь потоков в одном соединении, как у Happ.
         //
