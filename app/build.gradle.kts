@@ -17,8 +17,8 @@ android {
         applicationId = "com.zen.nitro"
         minSdk = 24                 // Android 7.0 (VpnService + современные протоколы)
         targetSdk = 34
-        versionCode = 31
-        versionName = "3.7.2"
+        versionCode = 32
+        versionName = "3.7.3"
         // Ядро sing-box (libbox.aar) — нативные .so под эти ABI.
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
     }

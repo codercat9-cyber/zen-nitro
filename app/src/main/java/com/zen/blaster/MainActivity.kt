@@ -128,6 +128,8 @@ class MainActivity : ComponentActivity() {
     // Если без подмены она встанет, человек должен об этом узнать: значит
     // режим подмены ей мешает, и держать его включённым незачем.
     private var frontFailedFor = ""
+    // Нода, которую модуль Xray не поднял и которую мы уже пробуем встроенным.
+    private var moduleFailedFor = ""
 
     // То же для связки с ByeDPI: нода не встала через щит, но встала напрямую.
     private var chainFailedFor = ""
@@ -386,6 +388,15 @@ class MainActivity : ComponentActivity() {
             if (on && engine.intValue != 1) nodes.getOrNull(selected.intValue)?.let { n ->
                 prefs.rememberCarrierWin(com.zen.blaster.core.NetInfo.carrierKey(this), traitKey(n))
                 prefs.rememberCarrierLoss(com.zen.blaster.core.NetInfo.carrierKey(this), traitKey(n), lost = false)
+                // Встала на встроенном Xray, а на модуле — нет: модулю провал.
+                if (moduleFailedFor == keyOf(n) && !com.zen.blaster.core.XrayEngine.moduleInUse &&
+                    com.zen.blaster.core.CoreModules.active(this, com.zen.blaster.core.CoreModules.XRAY) != null) {
+                    val off = com.zen.blaster.core.CoreModules.report(this, com.zen.blaster.core.CoreModules.XRAY,
+                        false, "«${n.name}» встала только на встроенном ядре")
+                    com.zen.blaster.core.Blackbox.note("↩ «${n.name}» встала на встроенном Xray, на модуле — нет" +
+                        (if (off) ": модуль снят после трёх таких провалов" else ": модулю засчитан провал"))
+                }
+                moduleFailedFor = ""
                 // Встала откатом на Xray — запоминаем; встала откатом на
                 // sing-box — значит, Xray ей больше не обязателен.
                 when (attemptForceXray) {
@@ -1696,6 +1707,25 @@ class MainActivity : ComponentActivity() {
                     chainFailedFor = keyOf(n)
                     toggleConnect(force = true, forceXray = forceXray,
                         noFront = noFront, noChain = true)
+                } else if (viaXray && com.zen.blaster.core.XrayEngine.moduleInUse && moduleFailedFor != keyOf(n)) {
+                    // ОТКАТ МОДУЛЯ XRAY НА ВСТРОЕННОЕ ЯДРО.
+                    //
+                    // Новое ядро ставится модулем (26.10.31 — строже к нодам без
+                    // TLS). Нода на нём не встала — та же нода сначала на
+                    // встроенном, проверенном ядре, и только потом дальше по
+                    // каскаду. Встанет там — модулю засчитывается провал, и
+                    // после трёх таких он снимается сам (CoreModules.report).
+                    moduleFailedFor = keyOf(n)
+                    val mv = com.zen.blaster.core.CoreModules.active(this@MainActivity,
+                        com.zen.blaster.core.CoreModules.XRAY)?.version ?: "?"
+                    log("↩ Модуль Xray $mv не поднял ноду — пробую встроенное ядро")
+                    com.zen.blaster.core.Blackbox.outcome(false,
+                        "модуль Xray $mv не поднял ноду за ${waitMs / 1000} с — пробую встроенное ядро")
+                    com.zen.blaster.core.XrayEngine.builtinNext = true
+                    stopTunnel()
+                    kotlinx.coroutines.delay(900)
+                    connState.intValue = 1
+                    toggleConnect(force = true, forceXray = true, noFront = noFront, noChain = noChain)
                 } else if (canFallback && ZenVpnService.channelProven && !rejected) {
                     // КАНАЛ ЧЕРЕЗ НОДУ ЖИВ — ВТОРОЕ ЯДРО НЕ ПОМОЖЕТ.
                     //
@@ -3335,11 +3365,15 @@ class MainActivity : ComponentActivity() {
             // 1989 возвратах. Стадия сторожа — в Stats.stage, по ней и судим.
             val stage by com.zen.blaster.core.Stats.stage.collectAsState()
             val dead = state == 2 && stage.startsWith("Нода не принимает")
+            val noNet = state == 2 && stage.startsWith("Нет сети")
+            val silent = state == 2 && stage.startsWith("Канал молчит")
             val shaky = state == 2 && !dead && (stage.startsWith("Переподключаюсь") ||
-                stage.startsWith("Поднимаю ядро") || stage.startsWith("Проверяю канал"))
+                stage.startsWith("Поднимаю ядро") || stage.startsWith("Проверяю канал") || noNet || silent)
             Text(
                 when {
                     dead -> "Нет связи"
+                    noNet -> "Нет сети"
+                    silent -> "Связь пропала…"
                     shaky -> "Переподключаюсь…"
                     state == 2 -> "Подключено"
                     state == 1 -> "Подключение…"

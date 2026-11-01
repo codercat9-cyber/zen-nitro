@@ -430,9 +430,14 @@ class ZenVpnService : VpnService(), PlatformInterface {
             // Отдельный процесс, потому что два gomobile-рантайма в одном не живут.
             xrayConfig?.let { cfg ->
                 Stats.stage.value = "Поднимаю ядро Xray…"
-                say("🚀 Ядро Xray ${XrayEngine.version(this)}" +
-                    (if (com.zen.blaster.core.CoreModules.active(this, com.zen.blaster.core.CoreModules.XRAY) != null)
-                        " (модуль)" else "") + " — поднимаю…")
+                // Какое ядро на самом деле пойдёт: при откате и для голого
+                // VLESS — встроенное, даже если модуль стоит. Раньше здесь
+                // писалось «модуль», а строкой ниже — «откат на встроенное».
+                val viaModule = com.zen.blaster.core.CoreModules.active(this,
+                    com.zen.blaster.core.CoreModules.XRAY) != null &&
+                    !XrayEngine.builtinNext && !XrayEngine.bareVless(cfg)
+                say("🚀 Ядро Xray ${XrayEngine.version(this, builtin = !viaModule)}" +
+                    (if (viaModule) " (модуль)" else "") + " — поднимаю…")
                 if (!XrayEngine.start(this, cfg) { msg -> sayCore(msg) }) {
                     if (!alive(gen)) return
                     // Без Xray нода просто не заработает — честно падаем, а не
@@ -872,6 +877,7 @@ class ZenVpnService : VpnService(), PlatformInterface {
                     if (best > 0 && Stats.ping.value > 500 && Stats.ping.value > best * 3)
                         com.zen.blaster.core.RadioKick.kick(this,
                             "пинг ${Stats.ping.value} мс при обычных $best") { say(it) }
+                    clearWaitStage()
                     noNetLogged = false
                     trafficLogged = false
                 } else if (statsRunning && movingRecently(pat)) {
@@ -889,6 +895,7 @@ class ZenVpnService : VpnService(), PlatformInterface {
                         trafficLogged = true
                     }
                     misses = 0
+                    clearWaitStage()
                     noNetLogged = false
                 } else if (statsRunning) {
                     // СНАЧАЛА смотрим, есть ли у телефона сеть вообще.
@@ -904,10 +911,14 @@ class ZenVpnService : VpnService(), PlatformInterface {
                             say("… сети нет — жду, туннель не трогаю")
                             noNetLogged = true
                         }
+                        // На кольце — правда: «Нет сети», а не «Подключено»
+                        // (01.11.2026, Xiaomi: 32 с без сети, кольцо молчало).
+                        Stats.stage.value = "Нет сети — жду"
                         misses = 0
                     } else {
                         noNetLogged = false
                         misses++
+                        if (misses >= 2) Stats.stage.value = "Канал молчит — восстанавливаю"
                         // Второй промах подряд при живой сети — пора будить
                         // радио: на сотовой связи чаще всего это модем уснул
                         // или сота увела на EDGE, а не сервер умер.
@@ -1010,6 +1021,12 @@ class ZenVpnService : VpnService(), PlatformInterface {
     // настоящий физический канал. Если сети нет вовсе (доза, лифт, метро,
     // пересадка Wi-Fi→LTE), провалившийся замер ничего не говорит о сервере,
     // и рвать из-за него живой туннель нельзя.
+    // Канал ожил — снимаем с кольца «Нет сети» / «Канал молчит».
+    private fun clearWaitStage() {
+        val s = Stats.stage.value
+        if (s.startsWith("Нет сети") || s.startsWith("Канал молчит")) Stats.stage.value = ""
+    }
+
     private fun hasUnderlyingNet(): Boolean = try {
         val n = cm.activeNetwork
         val c = n?.let { cm.getNetworkCapabilities(it) }

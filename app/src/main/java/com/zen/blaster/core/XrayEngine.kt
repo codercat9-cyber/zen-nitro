@@ -137,8 +137,9 @@ object XrayEngine {
     fun available(ctx: Context): Boolean =
         binary(ctx).canExecute() || CoreModules.active(ctx, CoreModules.XRAY) != null
 
-    fun version(ctx: Context): String = try {
-        val p = ProcessBuilder(command(ctx).first + "version").redirectErrorStream(true).start()
+    fun version(ctx: Context, builtin: Boolean = false): String = try {
+        val cmd = if (builtin) listOf(binary(ctx).absolutePath) else command(ctx).first
+        val p = ProcessBuilder(cmd + "version").redirectErrorStream(true).start()
         val out = p.inputStream.bufferedReader().readText()
         p.waitFor()
         Regex("Xray ([0-9.]+)").find(out)?.groupValues?.get(1) ?: "?"
@@ -162,7 +163,18 @@ object XrayEngine {
         }
     } catch (_: Throwable) { false }
 
+    // Следующий запуск — на встроенном ядре: откат, когда нода не встала на
+    // модуле (каскад в MainActivity). Срабатывает один раз.
+    @Volatile var builtinNext = false
+
     fun start(ctx: Context, configJson: String, onLog: (String) -> Unit): Boolean {
+        if (builtinNext && CoreModules.active(ctx, CoreModules.XRAY) != null) {
+            builtinNext = false
+            onLog("↩ Откат: эту ноду — на встроенном ядре Xray")
+            forceBuiltin = true
+            return try { startOnce(ctx, configJson, onLog) } finally { forceBuiltin = false }
+        }
+        builtinNext = false
         if (CoreModules.active(ctx, CoreModules.XRAY) != null && bareVless(configJson)) {
             onLog("🧩 VLESS без TLS — беру встроенное ядро Xray: новые модули такое до IP не пускают")
             forceBuiltin = true
