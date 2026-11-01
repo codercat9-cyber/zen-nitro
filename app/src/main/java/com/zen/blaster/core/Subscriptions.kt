@@ -46,6 +46,7 @@ object Subscriptions {
             withContext(Dispatchers.IO) {
         unparsed.clear()
         report.clear()
+        stubs.clear()
         val nodes = mutableListOf<Node>()
         info = ""
         renamed.clear()
@@ -195,7 +196,15 @@ object Subscriptions {
         for ((agent, res) in union) {
             val short = agent.substringBefore('/')
             if (res == null) { report += "$short: не ответил"; continue }
-            val part = decode(res.second)
+            var part = decode(res.second)
+            // «Нода» на 0.0.0.0 или 127.x — не сервер, а табличка панели
+            // («🚨 Подписка закончилась»): 01.11.2026 у Пантеры такая попадала
+            // в список, выбиралась, и клиент «подключался» в пустоту.
+            val fake = part.filter { it.addr == "0.0.0.0" || it.addr.startsWith("127.") || it.port <= 0 }
+            if (fake.isNotEmpty()) {
+                if (fake.size == part.size) lastStub = fake.joinToString(" · ") { it.name.trim() }.take(200)
+                part = part - fake.toSet()
+            }
             report += "$short: HTTP ${res.first}, ${res.second.length} симв. → ${part.size} нод"
             // ОТВЕТИЛА, НО НИ ОДНОЙ НОДЫ — САМЫЙ ОБИДНЫЙ СЛУЧАЙ.
             //
@@ -211,6 +220,7 @@ object Subscriptions {
             // из URL сюда не попадает — это тело ответа, а не адрес.
             if (part.isEmpty() && lastStub.isNotEmpty()) {
                 report += "   ↳ заглушка панели: $lastStub"
+                stubs[url] = lastStub
                 lastStub = ""
             } else if (part.isEmpty() && res.second.isNotBlank()) {
                 val head = res.second.trim().take(110)
@@ -266,7 +276,7 @@ object Subscriptions {
     // Возвращаем и код ответа: «панель молчит» и «панель отдала 403» лечатся
     // по-разному, а со стороны выглядят одинаково — пустым списком.
     private fun get(url: String, agent: String): Pair<Int, String>? = try {
-        http.newCall(
+        client().newCall(
             Request.Builder().url(url)
                 .header("User-Agent", agent)
                 .header("Accept", "*/*")
@@ -356,6 +366,28 @@ object Subscriptions {
     // Что ответила панель, когда не признала нас за своего. Пустая строка —
     // такого не было.
     @Volatile var lastStub: String = ""
+
+    // Что панель сказала вместо нод — по адресу подписки: «Достигнут лимит
+    // устройств», «Subscription expired». Показывается на заголовке подписки
+    // и всплывашкой: раньше это тонуло в журнале, а человек видел старые,
+    // уже нерабочие ноды и «Подключено» при мёртвом канале.
+    val stubs = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    // Туннель поднят, но не проверен (петля сторожа, kill switch) — подписку
+    // качаем по физической сети: иначе мёртвый туннель не даёт скачать то,
+    // что его бы и починило. 01.11.2026, Realme: 1989 возвратов за день,
+    // и ни одна загрузка подписок не прошла.
+    private fun client(): OkHttpClient {
+        val vpn = com.zen.blaster.vpn.ZenVpnService
+        if (!vpn.running || vpn.channelProven) return http
+        val net = Resolver.physical() ?: return http
+        return http.newBuilder()
+            .socketFactory(net.socketFactory)
+            .dns(object : okhttp3.Dns {
+                override fun lookup(hostname: String) = net.getAllByName(hostname).toList()
+            })
+            .build()
+    }
 
     // Разбор тела подписки: голые ссылки, base64 или base64 с переносами.
     internal fun decode(body: String): List<Node> {

@@ -208,8 +208,24 @@ class ZenVpnService : VpnService(), PlatformInterface {
     // по-русски и запоминаем ноду: со следующей попытки проверку внешнего
     // имени для неё снимем, и она поднимется.
     @Volatile private var certSaid = false
+    // Ошибка сертификата НОДЫ в этом подъёме и сколько возвратов подряд она
+    // повторяется. Это не обрыв, а «сервер не принимает имя ноды» — повтором
+    // не лечится. 01.11.2026, Realme: сторож 1989 раз за день поднимал одну
+    // ноду (в подписке имя eh.vk.ru, сервер ждёт *.avito.ru), а kill switch
+    // всё это время держал телефон без интернета.
+    @Volatile private var certHit = false
+    @Volatile private var certStreak = 0
+    @Volatile private var certReal = ""
+    @Volatile private var certWant = ""
+
     private fun catchCertMismatch(line: String) {
-        if (certSaid || !line.contains("certificate is valid for")) return
+        if (!line.contains("certificate is valid for")) return
+        if (!(line.contains("dns:") || line.contains("exchange failed") || line.contains("process packet"))) {
+            certHit = true
+            certReal = line.substringAfter("certificate is valid for ").substringBefore(',').take(60).trim()
+            certWant = Regex("""not ([^\s,"]+)""").find(line)?.groupValues?.get(1) ?: Stats.server.value
+        }
+        if (certSaid) return
         // Ошибка сертификата DNS-РЕЗОЛВЕРА — не беда ноды. 14.10.2026 с
         // ControlD по неверному адресу каждая строка «dns: exchange failed …
         // certificate is valid for 76.76.2.22…» снимала проверку имени с
@@ -221,11 +237,13 @@ class ZenVpnService : VpnService(), PlatformInterface {
         // обрезаем — получалось «*.iperf.uk, i». Берём первое имя целиком.
         val real = line.substringAfter("certificate is valid for ")
             .substringBefore(',').take(60).trim().trimEnd('.', ' ')
-        val want = line.substringAfter("Post \"https://").substringBefore('/')
-            .ifEmpty { Stats.server.value }
-        say("🔐 Сервер представляется как $real, а подписка ведёт на $want —")
-        say("   это поломка у провайдера. Снимаю проверку имени для этой ноды:")
-        say("   данные внутри всё равно зашифрованы ключами ноды.")
+        // Чьё имя ждали — из «…, not имя». Раньше искали «Post "https://», а
+        // его в журнале 1.14 нет: substringAfter возвращал всю строку, и в
+        // журнале выходило «подписка ведёт на ERROR[0001] …».
+        val want = Regex("""not ([^\s,"]+)""").find(line)?.groupValues?.get(1) ?: Stats.server.value
+        say("🔐 Сервер представляется как $real, а в подписке имя $want —")
+        say("   сервер это имя не принимает. Чаще всего подписка устарела:")
+        say("   обновите её. Для обычного TLS снимаю проверку имени.")
         com.zen.blaster.core.Blackbox.note(
             "🔐 «${Stats.server.value}»: сертификат на $real вместо $want — " +
             "снимаю проверку внешнего имени")
@@ -518,6 +536,7 @@ class ZenVpnService : VpnService(), PlatformInterface {
             Stats.stage.value = ""
             everUp = true
             reconnects = 0                 // связь есть — счётчик неудач обнуляем
+            certStreak = 0
             onState?.invoke(true)          // ← теперь «Подключено» честное
             askWhereWeAre(gen)
             checkDnsQuietly()
@@ -1129,6 +1148,23 @@ class ZenVpnService : VpnService(), PlatformInterface {
         // он нажимал «Подключить», видел «Подключено», а через минуту связи не
         // было и никто её не восстанавливал. Пока туннель хоть раз поднялся,
         // мы пробуем бесконечно — решение прекратить принимает только человек.
+        // Три возврата подряд упали на «сервер не принимает имя ноды» —
+        // дальше не долбим: это не обрыв, повтор не поможет. Kill switch
+        // трафик не выпускает, но петли больше нет, а причина — на экране.
+        certStreak = if (certHit) certStreak + 1 else 0
+        certHit = false
+        if (certStreak >= 3) {
+            say("⛔ Нода не принимает соединение: сервер ждёт $certReal, а в подписке имя $certWant.")
+            say("   Повтором это не лечится — обновите подписку или выберите другую ноду.")
+            com.zen.blaster.core.Blackbox.note("⛔ сторож остановлен: $certStreak возврата подряд — " +
+                "сервер не принимает имя ноды ($certWant, сервер — $certReal)")
+            Stats.stage.value = "Нода не принимает соединение — обновите подписку"
+            if (prefs.killSwitch) {
+                say("🔒 Kill switch держит трафик закрытым — откройте Zen и смените ноду")
+                return
+            }
+            stopVpn(); return
+        }
         if (reconnects >= 5 && !everUp) {
             say("❌ Пять неудачных попыток подряд — сдаюсь, смените сервер")
             if (prefs.killSwitch) {

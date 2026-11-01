@@ -205,6 +205,10 @@ class Prefs(context: Context) {
         } catch (e: Exception) { emptyList() }
     }
 
+    // Пустым кеш обычно не затираем — но удалённая подписка должна уйти и
+    // из него, иначе её ноды вернутся при следующем запуске.
+    fun clearNodeCache() { sp.edit().remove("nodeCache").apply() }
+
     fun cacheNodes(list: List<com.zen.blaster.model.Node>) {
         if (list.isEmpty()) return                 // пустым кэш не затираем
         val arr = JSONArray()
@@ -705,8 +709,11 @@ class Prefs(context: Context) {
     fun renameSubscription(url: String, name: String) =
         saveSubscriptions(subscriptions().map { if (it.url == url) it.copy(name = name) else it })
 
-    fun removeSubscription(index: Int) =
-        saveSubscriptions(subscriptions().filterIndexed { i, _ -> i != index })
+    // По ССЫЛКЕ, а не по номеру строки. Номер брался из списка на экране, а
+    // список в настройках мог уже поменяться (сведение повторов, имя от
+    // панели): 01.11.2026 «удалить» у Sirius снесла соседнюю FastLane.
+    fun removeSubscription(url: String) =
+        saveSubscriptions(subscriptions().filter { it.url.trim() != url.trim() })
 
     // ПУСТО — И ТАК ДОЛЖНО БЫТЬ.
     //

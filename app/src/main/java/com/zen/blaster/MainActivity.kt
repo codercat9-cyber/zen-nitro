@@ -145,6 +145,24 @@ class MainActivity : ComponentActivity() {
     // просто не появлялись.
     private val pingTick = mutableIntStateOf(0)
 
+    // Подписка → что её панель отдала вместо нод (см. Subscriptions.stubs).
+    private val subStubs = mutableStateMapOf<String, String>()
+
+    // Удалённая подписка уходит из списка СРАЗУ, не дожидаясь сети. Раньше
+    // её ноды держались до удачной загрузки, а при мёртвом туннеле загрузка
+    // не проходила, и клиент «оставлял прошлый список» — вместе с удалённой
+    // подпиской (01.11.2026: «кнопка удалить ничего не удаляет»).
+    private fun dropSubNodes(subName: String, what: String) {
+        val before = nodes.size
+        nodes.removeAll { it.sub == subName }
+        restoreSelection()
+        if (nodes.isEmpty()) prefs.clearNodeCache() else prefs.cacheNodes(nodes.toList())
+        subStubs.remove(subName)
+        pingTick.intValue++
+        val gone = before - nodes.size
+        toast("$what удалена" + if (gone > 0) " — убрано нод: $gone" else "")
+    }
+
     // Ход ручного замера: сколько нод уже померено из скольких; -1 — замер не
     // идёт. Видно на самой кнопке: «пинг 37/145». Раньше цифры появлялись
     // разом в самом конце, и до того кнопка выглядела мёртвой.
@@ -719,6 +737,9 @@ class MainActivity : ComponentActivity() {
         // дольше двух минут — не держим кнопку мёртвой, начинаем заново.
         if (subsLoading.value && System.currentTimeMillis() - subsLoadingAt < 120_000) {
             log("⏳ Подписки уже обновляются — дождитесь")
+            // Видно на месте, а не только во вкладке логов: иначе кнопка
+            // выглядит сломанной (жалоба 01.11.2026).
+            toast("Подписки уже обновляются — подожди немного")
             return
         }
         log("Загружаю подписки…")
@@ -770,6 +791,14 @@ class MainActivity : ComponentActivity() {
             com.zen.blaster.core.Blackbox.note(
                 if (pingDue) "📡 пинги серверов перемерены"
                 else "📡 пинги свежие (${(System.currentTimeMillis() - prefs.lastPingAll) / 60_000} мин) — не перемеряю")
+            // Что панели сказали вместо нод — «лимит устройств», «подписка
+            // закончилась». На заголовок подписки и всплывашкой: человек должен
+            // видеть, что ноды этой подписки — старые и могут не работать.
+            val gotNames = fresh.map { it.sub }.toSet()
+            val stubbed = srcs.filter { it.name !in gotNames }
+                .mapNotNull { src -> Subscriptions.stubs[src.url]?.let { src.name to it } }
+            subStubs.clear(); stubbed.forEach { (n, t) -> subStubs[n] = t }
+            if (stubbed.isNotEmpty()) toast(stubbed.joinToString("\n") { "«${it.first}»: ${it.second}" }.take(200))
             if (fresh.isEmpty()) {
                 // ПУСТОЙ ответ — это почти всегда лежащая сеть, а не «серверов
                 // не стало». Затирать список нельзя: без нод не подключиться
@@ -2864,9 +2893,16 @@ class MainActivity : ComponentActivity() {
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Text(if (open) "▾" else "▸", color = ZenCyan, fontSize = 13.sp)
-                                Text("  $subName", color = ZenCyan, fontSize = 13.sp,
-                                    fontWeight = FontWeight.Bold, maxLines = 1,
-                                    modifier = Modifier.weight(1f))
+                                Column(Modifier.weight(1f)) {
+                                    Text("  $subName", color = ZenCyan, fontSize = 13.sp,
+                                        fontWeight = FontWeight.Bold, maxLines = 1)
+                                    // Панель вместо нод отдала табличку — ноды
+                                    // ниже старые и могут не работать.
+                                    subStubs[subName]?.let { stub ->
+                                        Text("  ⚠ $stub — ноды ниже старые", color = Color(0xFFE87A3A),
+                                            fontSize = 11.sp, maxLines = 2)
+                                    }
+                                }
                                 // На закрытой полке видно, здесь ли выбранный.
                                 if (!open && hasSelected)
                                     Text("выбран  ", color = ZenCyan, fontSize = 12.sp)
@@ -3456,8 +3492,9 @@ class MainActivity : ComponentActivity() {
                         }
                         Text("удалить", color = ZenRed, fontSize = 13.sp,
                             modifier = Modifier.clickable {
-                                prefs.removeSubscription(i)
+                                prefs.removeSubscription(s.url)
                                 subs = prefs.subscriptions()
+                                dropSubNodes(s.name, "Подписка «${s.name}»")
                                 loadServers()
                             })
                     }
@@ -3604,6 +3641,7 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.clickable {
                             mine.forEach { prefs.removeManualLink(it) }
                             mine = prefs.manualLinks()
+                            dropSubNodes("Свои ссылки", "Вкладка «Свои ссылки»")
                             log("🗑 Вкладка «Свои ссылки» очищена")
                             loadServers()
                         })
@@ -3618,6 +3656,7 @@ class MainActivity : ComponentActivity() {
                             modifier = Modifier.clickable {
                                 prefs.removeManualLink(l)
                                 mine = prefs.manualLinks()
+                                if (mine.isEmpty()) dropSubNodes("Свои ссылки", "Последняя своя ссылка")
                                 log("🗑 Ссылка удалена")
                                 loadServers()
                             })
@@ -3717,7 +3756,11 @@ class MainActivity : ComponentActivity() {
                         color = ZenGray, fontSize = 11.sp, maxLines = 1,
                         modifier = Modifier.weight(1f))
                     Text("удалить", color = Color(0xFFE87A3A), fontSize = 11.sp,
-                        modifier = Modifier.clickable { prefs.removeWlLink(l); loadServers() })
+                        modifier = Modifier.clickable {
+                            prefs.removeWlLink(l)
+                            if (prefs.wlLinks().isEmpty()) dropSubNodes(WL_GROUP, "Белый список")
+                            loadServers()
+                        })
                 }
             }
             // Сразу показываем, сколько из них реально годится под подмену.
