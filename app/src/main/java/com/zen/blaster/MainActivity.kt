@@ -13,7 +13,9 @@ import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
@@ -68,6 +70,13 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
+// Готовые метки для нод: метка — подсказка человеку, куда эта нода годится.
+private val NODE_LABEL_PRESETS = listOf(
+    "🤖 AI" to "для нейросетей — чистый зарубежный выход",
+    "🎬 Видео" to "YouTube и стримы",
+    "🎮 Игры" to "низкий пинг",
+)
+
 class MainActivity : ComponentActivity() {
 
     private lateinit var prefs: Prefs
@@ -104,6 +113,11 @@ class MainActivity : ComponentActivity() {
     private val titleFont = mutableIntStateOf(0)
     private val titleSize = mutableIntStateOf(30)
     private val showTitleDlg = mutableStateOf(false)
+
+    // Метки нод от человека («🤖 AI» и т. п.) и нода, которой метку сейчас
+    // ставят (долгое нажатие в списке).
+    private val nodeLabels = mutableStateOf<Map<String, String>>(emptyMap())
+    private val labelFor = mutableStateOf<String?>(null)
 
     // Раздельное туннелирование: РУ-сайты и РУ-приложения мимо туннеля.
     private val splitRu = mutableStateOf(false)
@@ -357,6 +371,7 @@ class MainActivity : ComponentActivity() {
             selectedAwg.intValue = 0; prefs.selectedAwg = 0
         }
         titleText.value = prefs.titleText
+        nodeLabels.value = prefs.nodeLabels()
         titleFont.intValue = prefs.titleFont
         titleSize.intValue = prefs.titleSize
         splitRu.value = prefs.geoRouting
@@ -396,6 +411,11 @@ class MainActivity : ComponentActivity() {
                     com.zen.blaster.core.Blackbox.note("↩ «${n.name}» встала на встроенном Xray, на модуле — нет" +
                         (if (off) ": модуль снят после трёх таких провалов" else ": модулю засчитан провал"))
                 }
+                // Встала на самом модуле — вот это и есть его удача. running —
+                // потому что moduleInUse помнит прошлый запуск Xray и после
+                // перехода на sing-box.
+                else if (com.zen.blaster.core.XrayEngine.moduleInUse && com.zen.blaster.core.XrayEngine.running)
+                    com.zen.blaster.core.CoreModules.report(this, com.zen.blaster.core.CoreModules.XRAY, true)
                 moduleFailedFor = ""
                 // Встала откатом на Xray — запоминаем; встала откатом на
                 // sing-box — значит, Xray ей больше не обязателен.
@@ -1478,10 +1498,21 @@ class MainActivity : ComponentActivity() {
         // sing-box, и перестали работать ВСЕ разом. Менять рабочее ради
         // красивой идеи нельзя, поэтому откат к прежнему правилу.
         // Нода, которая в прошлый раз встала только через Xray, — сразу им.
-        val remembered = n != null && XrayEngine.bothPossible(n) && traitKey(n) in prefs.xrayNodes()
+        //
+        // И СОСЕДИ ПО ВХОДУ. У Триллера десятки каскадов сидят на одном входе
+        // (91.243.86.67, разные порты) с одной и той же настройкой сервера.
+        // 04.11, Tele2: sing-box их не поднимал, встроенный Xray — за 5 с, и
+        // каждая нода заново теряла по 17–20 с на sing-box, прежде чем
+        // узнать то же, что уже знали её соседи. Две соседки по адресу,
+        // вставшие только через Xray, — урок для всего входа.
+        val xr = prefs.xrayNodes()
+        val selfXray = n != null && traitKey(n) in xr
+        val neighbours = n?.let { m -> xr.count { it != traitKey(m) && it.substringBeforeLast(':') == m.addr } } ?: 0
+        val remembered = n != null && XrayEngine.bothPossible(n) && (selfXray || neighbours >= 2)
         val autoXray = vpnOn && n != null && (XrayEngine.handles(n) || remembered) && XrayEngine.available(this)
         if (remembered && forceXray == null && prefs.tunnelEngine == 0)
-            log("🧠 «${n!!.name}» в прошлый раз поднялась только через Xray — сразу через него")
+            log(if (selfXray) "🧠 «${n!!.name}» в прошлый раз поднялась только через Xray — сразу через него"
+                else "🧠 Соседи «${n!!.name}» по входу ${n.addr} ($neighbours) встают только через Xray — сразу через него")
         coreRejected = false
         attemptForceXray = forceXray
         val pinned = prefs.tunnelEngine          // 0 авто, 1 sing-box, 2 Xray
@@ -2055,6 +2086,7 @@ class MainActivity : ComponentActivity() {
         }
         if (showPicker.value) ServerPicker()
         if (showTitleDlg.value) TitleDialog()
+        labelFor.value?.let { LabelDialog(it) }
         if (showAppPicker.value) AppPicker()
         if (showModesDlg.value) ModesDialog()
         if (showJournal.value) JournalDialog()
@@ -2641,6 +2673,83 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // Метка ноды — маленькая плашка перед именем.
+    @Composable
+    private fun LabelChip(label: String, size: Int, modifier: Modifier = Modifier.padding(end = 8.dp)) {
+        Surface(
+            color = ZenCyan.copy(alpha = 0.16f),
+            shape = RoundedCornerShape(6.dp),
+            modifier = modifier
+        ) {
+            Text(label, color = ZenCyan, fontSize = size.sp, fontWeight = FontWeight.Bold,
+                maxLines = 1, modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp))
+        }
+    }
+
+    // ПОДПИСЬ НОДЫ. Человек знает про ноду то, чего не знаем мы: «этот
+    // каскад вышел в США напрямую — для нейросетей». Готовые метки — одним
+    // нажатием, своя — текстом. Метка живёт по имени ноды (см. Prefs).
+    @Composable
+    private fun LabelDialog(name: String) {
+        val current = nodeLabels.value[name].orEmpty()
+        var text by remember(name) { mutableStateOf(current) }
+        fun save(v: String?) {
+            prefs.setNodeLabel(name, v)
+            nodeLabels.value = prefs.nodeLabels()
+            labelFor.value = null
+            log(if (v.isNullOrBlank()) "🏷 «$name»: метка снята" else "🏷 «$name» подписана: ${v.trim()}")
+        }
+        AlertDialog(
+            onDismissRequest = { labelFor.value = null },
+            containerColor = ZenCard,
+            title = { Text("Метка сервера", color = Color.White, fontSize = 17.sp) },
+            text = {
+                Column {
+                    Text(name, color = ZenGray, fontSize = 13.sp, maxLines = 2)
+                    // Что нода показала на деле: пускают ли с неё нейросети.
+                    // Метку «AI» ставить по факту, а не по флагу в имени.
+                    val ai = remember(name) { prefs.aiAccess(name) }
+                    Text(ai?.let { "🤖 проверено: ${it.first}" }
+                            ?: "🤖 нейросети с этой ноды ещё не проверялись — подключитесь к ней",
+                        color = if (ai?.second == true) ZenCyan else ZenGray, fontSize = 12.sp)
+                    Spacer(Modifier.height(10.dp))
+                    NODE_LABEL_PRESETS.forEach { (label, hint) ->
+                        Surface(
+                            color = if (label == current) ZenCyan.copy(alpha = 0.18f) else Color.Transparent,
+                            shape = RoundedCornerShape(6.dp),
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)
+                                .clickable { save(label) }
+                        ) {
+                            Row(Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically) {
+                                LabelChip(label, 13)
+                                Text(hint, color = ZenGray, fontSize = 12.sp)
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = text, onValueChange = { text = it.take(24) },
+                        singleLine = true,
+                        label = { Text("своя метка", fontSize = 12.sp) },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Color.White, unfocusedTextColor = Color.White,
+                            focusedBorderColor = ZenCyan, cursorColor = ZenCyan)
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { save(text) }) { Text("СОХРАНИТЬ", color = ZenCyan) }
+            },
+            dismissButton = {
+                if (current.isNotEmpty())
+                    TextButton(onClick = { save(null) }) { Text("СНЯТЬ МЕТКУ", color = ZenRed) }
+                else
+                    TextButton(onClick = { labelFor.value = null }) { Text("ОТМЕНА", color = ZenGray) }
+            }
+        )
+    }
+
     // Настройка надписи сверху — по тапу прямо по ней.
     //
     // Готика нравится не всем, а спорить о вкусах бессмысленно: проще дать
@@ -2791,6 +2900,7 @@ class MainActivity : ComponentActivity() {
     // это до конца не лечится, поэтому шторки больше нет: обычная панель
     // поверх экрана, единственный скроллируемый элемент — сам список.
     @Composable
+    @OptIn(ExperimentalFoundationApi::class)
     private fun ServerPicker() {
         Box(
             Modifier.fillMaxSize()
@@ -2953,7 +3063,10 @@ class MainActivity : ComponentActivity() {
                         val ok = n.supported()
                         Row(
                             Modifier.fillMaxWidth()
-                                .clickable {
+                                .combinedClickable(
+                                    // Долгое нажатие — подписать ноду («🤖 AI»).
+                                    onLongClick = { labelFor.value = n.name }
+                                ) {
                                     showPicker.value = false
                                     switchServer(i)      // переключение на лету
                                 }
@@ -2962,14 +3075,17 @@ class MainActivity : ComponentActivity() {
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Column(Modifier.weight(1f)) {
-                                Text(n.name,
-                                    color = when {
-                                        !ok -> ZenGray
-                                        n.gone && !(n.ping in 1..899 || n.lastOkAt > 0L) -> ZenGray
-                                        active -> ZenCyan
-                                        else -> Color.White
-                                    },
-                                    fontSize = 16.sp, maxLines = 1)
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    nodeLabels.value[n.name]?.let { LabelChip(it, 11) }
+                                    Text(n.name,
+                                        color = when {
+                                            !ok -> ZenGray
+                                            n.gone && !(n.ping in 1..899 || n.lastOkAt > 0L) -> ZenGray
+                                            active -> ZenCyan
+                                            else -> Color.White
+                                        },
+                                        fontSize = 16.sp, maxLines = 1)
+                                }
                                 Text(
                                     when {
                                         // ЖИВАЯ НОДА НЕ БЫВАЕТ «ПРОПАВШЕЙ».
@@ -3186,6 +3302,12 @@ class MainActivity : ComponentActivity() {
                     Box(Modifier.width(34.dp).height(4.dp)
                         .background(Color(0xFF3A3A3F), RoundedCornerShape(2.dp)))
                     Spacer(Modifier.height(18.dp))
+                    // Метка — строкой над именем: рядом с именем она съедала
+                    // место, и «Каскад NoV-US_AWG 3.0» обрезался до «Каскад NoV-…».
+                    if (!isAwg) n?.let { nodeLabels.value[it.name] }?.let {
+                        LabelChip(it, 13, Modifier)
+                        Spacer(Modifier.height(6.dp))
+                    }
                     // Имена серверов бывают длинными («Moscow-Czechia HYSTERIA2»).
                     // Раньше строка в 30sp без переполнения просто вылезала за
                     // карточку: флаг срезало слева, текст обрубало справа.
@@ -3194,11 +3316,17 @@ class MainActivity : ComponentActivity() {
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.Center
                     ) {
+                        // Не влезает — уменьшаем шрифт, пока не влезет (не мельче
+                        // 14sp, дальше — многоточие). «🇺🇸 Каскад NoV-US_AWG 3.0»
+                        // при крупном системном шрифте Xiaomi резался на «NoV-US_A…».
+                        val startSize = if (title.length > 18) 22 else 30
+                        var fit by remember(title) { mutableIntStateOf(startSize) }
                         Text(
                             title, color = Color.White,
-                            fontSize = if (title.length > 18) 22.sp else 30.sp,
+                            fontSize = fit.sp,
                             fontWeight = FontWeight.Normal, maxLines = 1,
                             overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                            onTextLayout = { if (it.hasVisualOverflow && fit > 14) fit -= 1 },
                             modifier = Modifier.weight(1f, fill = false)
                         )
                         Spacer(Modifier.width(8.dp))

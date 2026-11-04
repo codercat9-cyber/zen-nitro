@@ -58,11 +58,12 @@ object LineProbe {
 
     fun run(n: Node): Report = runRaw(n.addr, n.port,
         n.sni.ifEmpty { n.host }.ifEmpty { if (Resolver.isIpLiteral(n.addr)) "" else n.addr },
-        udp = n.quic(), tls = n.security != "none")
+        udp = n.quic(), tls = n.security != "none", reality = n.security == "reality")
 
     // То же по голым данным — для сторожа канала, у которого есть только
     // конфиг, а не нода.
-    fun runRaw(host: String, nodePort: Int, sni: String, udp: Boolean, tls: Boolean): Report {
+    fun runRaw(host: String, nodePort: Int, sni: String, udp: Boolean, tls: Boolean,
+               reality: Boolean = false): Report {
         val out = mutableListOf<String>()
         // У QUIC-ноды сам порт живёт по UDP и чужим пакетам не отвечает —
         // путь до хоста меряем по TCP 443 (см. Subscriptions.sideProbe).
@@ -113,8 +114,21 @@ object LineProbe {
         val (helloOk, helloVerdict) = hello(ip, port, sni, out, "3 TLS")
         if (!helloOk) {
             val (neutralOk, _) = hello(ip, port, "www.google.com", out, "3б TLS нейтр.")
+            // REALITY МОЛЧИТ НЕ ОТ БЛОКИРОВКИ.
+            //
+            // Сервер Reality на приветствие без ключа не отвечает сам, а
+            // пересылает его своей «маске» (dest) — и с любым именем ответ
+            // зависит от того, отвечает ли маска ЕМУ. У Триллера она молчит:
+            // журнал 03.11 — «режут TLS к этому адресу целиком», SPb-US
+            // «сгорела» и ушла в конец каскада, а в том же блоке через 11 с
+            // туннель через тот же адрес и то же имя поднялся. Тишина с обоими
+            // именами для Reality ничего не говорит о линии — так и пишем и
+            // ноду не жжём.
             return if (neutralOk) net(Kind.SNI, "Режут по имени $sni: с нейтральным именем этот же адрес " +
                     "отвечает — нужно другое имя маскировки (SNI)")
+                else if (reality) Report(out, "TCP до сервера проходит; на приветствие без ключа Reality " +
+                    "молчит с любым именем — так сервер прячется от проверок, линию по TLS здесь не " +
+                    "проверить. Это не приговор ноде", Kind.PARTIAL)
                 else net(Kind.TLS, helloVerdict + ". С нейтральным именем — тоже: режут TLS к этому адресу целиком")
         }
 

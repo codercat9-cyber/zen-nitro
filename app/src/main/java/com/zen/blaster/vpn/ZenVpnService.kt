@@ -165,6 +165,17 @@ class ZenVpnService : VpnService(), PlatformInterface {
         onLog?.invoke(clean)
         catchCertMismatch(clean)
         catchDeadInterface(clean)
+        if (refusal.isEmpty()) com.zen.blaster.core.CoreRefusal.parse(clean)?.let {
+            refusal = it
+            say("🔑 ${it.replaceFirstChar { c -> c.uppercase() }}")
+        }
+        // Сброс до ноды — после трёх подряд, одна строка бывает случайной.
+        if (refusal.isEmpty()) com.zen.blaster.core.CoreRefusal.refusedTo(clean)?.let { target ->
+            if (++refusedHits >= 3) {
+                refusal = com.zen.blaster.core.CoreRefusal.refusedText(target)
+                say("⛔ ${refusal.replaceFirstChar { c -> c.uppercase() }}")
+            }
+        }
         if (!realityRejectSaid && clean.contains("reality verification failed")) {
             realityRejectSaid = true
             onCoreReject?.invoke("reality")
@@ -208,6 +219,10 @@ class ZenVpnService : VpnService(), PlatformInterface {
     // по-русски и запоминаем ноду: со следующей попытки проверку внешнего
     // имени для неё снимем, и она поднимется.
     @Volatile private var certSaid = false
+    // Сервер ответил ОТКАЗОМ (не принял пароль) — см. CoreRefusal. Пока
+    // пусто, отказа не было; иначе — готовая фраза для итога блока.
+    @Volatile private var refusal = ""
+    @Volatile private var refusedHits = 0
     // Ошибка сертификата НОДЫ в этом подъёме и сколько возвратов подряд она
     // повторяется. Это не обрыв, а «сервер не принимает имя ноды» — повтором
     // не лечится. 01.11.2026, Realme: сторож 1989 раз за день поднимал одну
@@ -357,6 +372,8 @@ class ZenVpnService : VpnService(), PlatformInterface {
         certSaid = false
         dnsCertSaid = false
         realityRejectSaid = false
+        refusal = ""
+        refusedHits = 0
         channelProven = false
         starting.set(true)
         // Поколение поднимаем ПЕРВЫМ делом: с этой секунды любой поток прошлого
@@ -499,8 +516,8 @@ class ZenVpnService : VpnService(), PlatformInterface {
                 if (!alive(gen)) return
                 // Ядро поднялось, а канала нет: сервер не ответил на рукопожатие
                 // или ответ до нас не дошёл. Самый частый вид отказа в блокировку.
-                com.zen.blaster.core.Blackbox.outcome(false,
-                    "ядро поднялось, но канал не отвечает (сервер молчит либо ответ режут)")
+                com.zen.blaster.core.Blackbox.outcome(false, refusal.ifEmpty {
+                    "ядро поднялось, но канал не отвечает (сервер молчит либо ответ режут)" })
                 Stats.stage.value = ""
                 // Туннель уже работал — значит человек подключён и ждёт связи, а
                 // не объяснений. Продолжаем долбиться под капотом; kill switch
@@ -547,7 +564,8 @@ class ZenVpnService : VpnService(), PlatformInterface {
             onState?.invoke(true)          // ← теперь «Подключено» честное
             askWhereWeAre(gen)
             checkDnsQuietly()
-            com.zen.blaster.core.Blackbox.outcome(true, "канал проверен")
+            com.zen.blaster.core.Blackbox.outcome(true,
+                if (verifyNote.isEmpty()) "канал проверен" else "канал есть, но $verifyNote")
             startStats(tag)
             updateNotif(null)
         } catch (t: Throwable) {
@@ -1103,7 +1121,8 @@ class ZenVpnService : VpnService(), PlatformInterface {
     //  Проверка линии по данным из конфига — в журнал, параллельно с
     //  переподключением (его не задерживаем). Не чаще раза в 5 минут.
     @Volatile private var lastLineProbe = 0L
-    private class LineTarget(val host: String, val port: Int, val sni: String, val udp: Boolean, val tls: Boolean)
+    private class LineTarget(val host: String, val port: Int, val sni: String, val udp: Boolean, val tls: Boolean,
+                             val reality: Boolean = false)
 
     private fun lineTarget(cfg: String, xray: String?): LineTarget? = try {
         val outs = org.json.JSONObject(cfg).optJSONArray("outbounds")
@@ -1115,7 +1134,8 @@ class ZenVpnService : VpnService(), PlatformInterface {
         if (o != null && o.optString("type") != "socks") {
             val tls = o.optJSONObject("tls")
             LineTarget(o.optString("server"), o.optInt("server_port"), tls?.optString("server_name").orEmpty(),
-                o.optString("type") in setOf("hysteria2", "tuic"), tls?.optBoolean("enabled") == true)
+                o.optString("type") in setOf("hysteria2", "tuic"), tls?.optBoolean("enabled") == true,
+                tls?.optJSONObject("reality")?.optBoolean("enabled") == true)
         } else if (xray != null) {
             val x = org.json.JSONObject(xray).getJSONArray("outbounds").getJSONObject(0)
             val v = x.getJSONObject("settings").getJSONArray("vnext").getJSONObject(0)
@@ -1123,7 +1143,8 @@ class ZenVpnService : VpnService(), PlatformInterface {
             val sec = ss?.optString("security").orEmpty()
             val sni = (ss?.optJSONObject("realitySettings") ?: ss?.optJSONObject("tlsSettings"))
                 ?.optString("serverName").orEmpty()
-            LineTarget(v.getString("address"), v.getInt("port"), sni, false, sec == "tls" || sec == "reality")
+            LineTarget(v.getString("address"), v.getInt("port"), sni, false, sec == "tls" || sec == "reality",
+                sec == "reality")
         } else null
     } catch (_: Throwable) { null }
 
@@ -1134,7 +1155,7 @@ class ZenVpnService : VpnService(), PlatformInterface {
         if (t.host.isEmpty() || t.port <= 0) return
         lastLineProbe = now
         kotlin.concurrent.thread(name = "zen-lineprobe", isDaemon = true) {
-            val r = com.zen.blaster.core.LineProbe.runRaw(t.host, t.port, t.sni, t.udp, t.tls)
+            val r = com.zen.blaster.core.LineProbe.runRaw(t.host, t.port, t.sni, t.udp, t.tls, t.reality)
             com.zen.blaster.core.Blackbox.note("🩺 канал залип — проверка линии до ${t.host}:${t.port}")
             r.lines.forEach { com.zen.blaster.core.Blackbox.note("   $it") }
             com.zen.blaster.core.Blackbox.note("   ⇒ ${r.verdict}")
@@ -1277,7 +1298,12 @@ class ZenVpnService : VpnService(), PlatformInterface {
     // Проверка канала перед тем, как объявить «Подключено».
     // Замер делает САМО ядро через туннель (/proxies/<tag>/delay), поэтому
     // результат честный: если прокси мёртв — узнаем сразу, а не «через 5 минут».
+    // Что проверка нашла неладного при живом канале — для честного итога
+    // блока: «✔ канал проверен» рядом с «не пришло ни байта» было враньём.
+    @Volatile private var verifyNote = ""
+
     private fun verifyTunnel(tag: String, gen: Int): Boolean {
+        verifyNote = ""
         // 1. ждём, пока поднимется локальный API ядра
         Stats.stage.value = "Поднимаю ядро…"
         var apiUp = false
@@ -1295,15 +1321,10 @@ class ZenVpnService : VpnService(), PlatformInterface {
 
         // 2. живой ли канал вообще (замер до Cloudflare)
         Stats.stage.value = "Проверяю канал…"
-        var delay = -1
-        for (attempt in 1..3) {
-            if (!alive(gen)) return false
-            delay = probeDelay(tag, anyProbe())
-            if (delay > 0) break
-            Stats.stage.value = "Проверяю канал… ($attempt/3)"
-            Thread.sleep(600)
+        val delay = raceDelay(tag, gen, List(3) { anyProbe() }) { launched ->
+            Stats.stage.value = "Проверяю канал… ($launched/3)"
         }
-        if (delay <= 0) return false
+        if (!alive(gen) || delay <= 0) return false
         Stats.ping.value = delay
         Stats.feedPing(delay)
         channelProven = true
@@ -1315,12 +1336,14 @@ class ZenVpnService : VpnService(), PlatformInterface {
         //    ресурс через туннель — если ок, значит обход реально работает.
         if (!alive(gen)) return false
         Stats.stage.value = "Проверяю обход блокировок…"
-        val yt = probeDelay(tag, "https://www.youtube.com/generate_204")
+        val yt = raceDelay(tag, gen, List(2) { "https://www.youtube.com/generate_204" })
+        if (!alive(gen)) return false
         if (yt > 0) {
             say("✅ Обход блокировок работает (YouTube: $yt мс)")
             Stats.stage.value = "Блокировки пробиты · $yt мс"
         } else {
             say("⚠️ Канал есть, но YouTube не ответил — смените сервер или стратегию DPI.")
+            verifyNote = "YouTube не ответил"
             Stats.stage.value = "Канал есть, обход под вопросом"
             // Сколько пройдёт ЧЕРЕЗ туннель, прежде чем встанет: по этой
             // цифре отличаем заморозку потока на линии от глухого выхода.
@@ -1350,22 +1373,22 @@ class ZenVpnService : VpnService(), PlatformInterface {
         // разрешаются, человек видит худший из возможных отказов: «интернет
         // есть, но ничего не открывается». Значит об этом надо сказать прямо
         // и подсказать, что делать.
+        //
+        // СПРАШИВАЕМ САМ DNS ТУННЕЛЯ, а не сайты. Раньше «DNS через туннель»
+        // проверяли запросом к трём сайтам через ноду — но имя такого запроса
+        // разрешает СЕРВЕР, а не DNS туннеля. Журнал 04.11, SPb-AT: три сайта
+        // не ответили, в итог ушло «имена не разрешаются», а через секунду
+        // определение выхода (тоже по имени) спокойно сработало. Теперь
+        // вопрос задаём DNS-модулю ядра (/dns/query) — тем же путём, каким
+        // имена разрешают приложения. Не ответил и он — тогда правда беда.
         Stats.stage.value = "Проверяю DNS…"
-        val dnsProbes = listOf(
-            "https://one.one.one.one/",          // без SNI-имени Cloudflare
-            "https://checkip.amazonaws.com/",
-            "https://api.ipify.org/"
-        )
-        var dns = -1
-        for (p in dnsProbes) {
-            if (!alive(gen)) return false
-            dns = probeDelay(tag, p)
-            if (dns > 0) break
-        }
+        val dns = tunnelDns(gen, listOf("www.wikipedia.org", "www.bbc.com"))
+        if (!alive(gen)) return false
         if (dns > 0) {
             say("✅ DNS через туннель: $dns мс")
         } else {
             say("⚠️ Имена через туннель не разрешаются — канал есть, а сайты не откроются.")
+            verifyNote = listOf(verifyNote, "имена не разрешаются").filter { it.isNotEmpty() }.joinToString(", ")
             say("   Смените резолвер в настройках: Cloudflare и Google сейчас режут.")
             com.zen.blaster.core.Blackbox.note(
                 "🚫 DNS через туннель не работает (резолвер " +
@@ -1436,7 +1459,90 @@ class ZenVpnService : VpnService(), PlatformInterface {
                 (if (w.isp.isNotEmpty()) " · ${w.isp}" else ""))
             com.zen.blaster.core.Blackbox.note(
                 "🌍 «${Stats.server.value}» вышла в ${w.short()} (${w.ip})")
+            // Нейросети — раз в 12 часов на ноду: выход каскада меняется
+            // (WARP сегодня в Шарлотте, завтра на Кипре), но не каждую минуту.
+            val name = Stats.server.value
+            val prefs = com.zen.blaster.core.Prefs(this)
+            val seen = prefs.aiAccess(name)
+            if (name.isNotEmpty() && (seen == null || System.currentTimeMillis() - seen.third > 12 * 3600_000L)) {
+                val a = com.zen.blaster.core.LocalProbe.ai()
+                if (!alive(gen) || !running) return@thread
+                if (a.openai != null || a.anthropic != null) {
+                    prefs.rememberAiAccess(name, a.line(), a.good)
+                    say("🤖 Нейросети: ${a.line()}")
+                    com.zen.blaster.core.Blackbox.note("🤖 нейросети через «$name»: ${a.line()}")
+                }
+            }
         }
+    }
+
+    // ЗАМЕРЫ ВНАХЛЁСТ, А НЕ ПО ОЧЕРЕДИ.
+    //
+    // Журнал 04.11, Tele2, каскады Триллера: часть отдельных соединений
+    // через вход виснет на все 15 с (ядро пишет «context deadline
+    // exceeded»), соседние в ту же секунду проходят. Замеры шли по одному:
+    // первый попадал в зависшее соединение и съедал 15 с, второй успевал
+    // на 18,5 с — на волоске от срока «не отозвался за 20 с», а чаще не
+    // успевал, и рабочую ноду бросали. Каждый замер ядра — своё
+    // соединение, поэтому три с шагом в секунду: зависание одного больше
+    // не решает судьбу ноды, засчитываем первый ответ.
+    //
+    // Возвращает первый удачный замер или -1; оставшиеся замеры гасим.
+    private fun raceDelay(tag: String, gen: Int, targets: List<String>,
+                          onLaunch: (Int) -> Unit = {}): Int {
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(targets.size)
+        try {
+            val cs = java.util.concurrent.ExecutorCompletionService<Int>(pool)
+            var launched = 0
+            var finished = 0
+            val t0 = System.currentTimeMillis()
+            while (launched < targets.size || finished < launched) {
+                if (!alive(gen)) return -1
+                // Сервер уже сказал «не пущу» — ждать замеров незачем.
+                if (refusal.isNotEmpty()) return -1
+                if (launched < targets.size && System.currentTimeMillis() - t0 >= launched * 1000L) {
+                    val target = targets[launched]
+                    cs.submit(java.util.concurrent.Callable { probeDelay(tag, target) })
+                    launched++
+                    if (launched > 1) onLaunch(launched)
+                }
+                val f = cs.poll(250, java.util.concurrent.TimeUnit.MILLISECONDS) ?: continue
+                finished++
+                val d = try { f.get() } catch (_: Throwable) { -1 }
+                if (d > 0) return d
+            }
+            return -1
+        } finally { pool.shutdownNow() }
+    }
+
+    // Запрос имени через DNS-модуль ядра (clash_api /dns/query): два имени
+    // внахлёст, первый ответ с адресами — время в мс, иначе -1.
+    private fun tunnelDns(gen: Int, names: List<String>): Int {
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(names.size)
+        try {
+            val cs = java.util.concurrent.ExecutorCompletionService<Int>(pool)
+            names.forEach { name ->
+                cs.submit(java.util.concurrent.Callable {
+                    val t = System.currentTimeMillis()
+                    try {
+                        val r = com.zen.blaster.core.ClashApi.req("/dns/query?name=$name&type=A").build()
+                        val body = probeClient(12_000).newCall(r).execute().use { it.body?.string().orEmpty() }
+                        val ok = org.json.JSONObject(body).optJSONArray("Answer")?.length()?.let { it > 0 } == true
+                        if (ok) (System.currentTimeMillis() - t).toInt().coerceAtLeast(1) else -1
+                    } catch (_: Throwable) { -1 }
+                })
+            }
+            repeat(names.size) {
+                while (true) {
+                    if (!alive(gen)) return -1
+                    val f = cs.poll(250, java.util.concurrent.TimeUnit.MILLISECONDS) ?: continue
+                    val d = try { f.get() } catch (_: Throwable) { -1 }
+                    if (d > 0) return d
+                    break
+                }
+            }
+            return -1
+        } finally { pool.shutdownNow() }
     }
 
     // Замер задержки до конкретного URL силами ядра (через туннель).

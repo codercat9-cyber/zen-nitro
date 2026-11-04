@@ -227,6 +227,42 @@ class Prefs(context: Context) {
 
     fun clearDismissed() { sp.edit().remove("dismissedNodes").apply() }
 
+    // МЕТКИ НОД — подписи человека: «AI» на ноде с чистым выходом для
+    // нейросетей и т. п. Ключ — ИМЯ ноды, а не адрес: у каскадов провайдер
+    // меняет вход (сегодня NoV переехал на другой IP), а имя остаётся —
+    // метка не должна теряться при каждой перенастройке на стороне панели.
+    fun nodeLabels(): Map<String, String> = try {
+        val o = JSONObject(sp.getString("nodeLabels", "{}") ?: "{}")
+        o.keys().asSequence().associateWith { o.optString(it) }.filterValues { it.isNotBlank() }
+    } catch (_: Throwable) { emptyMap() }
+
+    // Пускают ли нейросети с выхода ноды (см. LocalProbe.ai): имя →
+    // «строка для человека|good|когда». Тоже по имени — рядом с меткой.
+    fun aiAccess(name: String): Triple<String, Boolean, Long>? = try {
+        val o = JSONObject(sp.getString("aiAccess", "{}") ?: "{}").optJSONObject(name)
+        o?.let { Triple(it.optString("line"), it.optBoolean("good"), it.optLong("at")) }
+    } catch (_: Throwable) { null }
+
+    fun rememberAiAccess(name: String, line: String, good: Boolean) {
+        if (name.isBlank()) return
+        try {
+            val root = JSONObject(sp.getString("aiAccess", "{}") ?: "{}")
+            root.put(name, JSONObject().put("line", line).put("good", good)
+                .put("at", System.currentTimeMillis()))
+            if (root.length() > 200) root.keys().asSequence().firstOrNull()?.let { root.remove(it) }
+            sp.edit().putString("aiAccess", root.toString()).apply()
+        } catch (_: Throwable) {}
+    }
+
+    fun setNodeLabel(name: String, label: String?) {
+        if (name.isBlank()) return
+        try {
+            val o = JSONObject(sp.getString("nodeLabels", "{}") ?: "{}")
+            if (label.isNullOrBlank()) o.remove(name) else o.put(name, label.trim().take(24))
+            sp.edit().putString("nodeLabels", o.toString()).apply()
+        } catch (_: Throwable) {}
+    }
+
     // Ссылки на отдельные серверы, добавленные вручную (vless://, hy2://…).
     fun manualLinks(): List<String> =
         sp.getStringSet("manualLinks", emptySet())?.toList()?.sorted() ?: emptyList()

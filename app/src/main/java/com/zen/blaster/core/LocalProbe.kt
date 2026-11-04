@@ -1,5 +1,8 @@
 package com.zen.blaster.core
 
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.toRequestBody
+
 // ============================================================================
 //  Как приложению сходить наружу ИЗНУТРИ собственного туннеля.
 //
@@ -79,6 +82,55 @@ object LocalProbe {
         .connectTimeout(6, java.util.concurrent.TimeUnit.SECONDS)
         .readTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
         .build()
+
+    // ПУСКАЮТ ЛИ НЕЙРОСЕТИ С ЭТОГО ВЫХОДА.
+    //
+    // Человек ставит на ноду метку «🤖 AI» — значит, должен знать, что с неё
+    // правда открываются ChatGPT и Claude, а не гадать по флагу в имени.
+    // 04.11: «🇺🇸 Каскад NoV-US» выходит в Новосибирске, а «🇺🇸 SPb-US» —
+    // то в Шарлотте, то на Кипре (выход через Cloudflare WARP). Спрашиваем
+    // сами службы, без ключа: «нет ключа» (401) — регион пускают, «страна не
+    // поддерживается» (403) — нет. Плюс страна, какой нас видит Cloudflare
+    // перед chatgpt.com, — по ней такие службы и решают.
+    class AiAccess(val openai: Boolean?, val anthropic: Boolean?, val loc: String) {
+        val good: Boolean get() = openai == true && anthropic == true
+        fun line(): String =
+            listOf("ChatGPT" to openai, "Claude" to anthropic).joinToString(" · ") { (n, v) ->
+                n + when (v) { true -> " ✓"; false -> " ✗ регион"; null -> " ?" }
+            } + (if (loc.isNotEmpty()) " · страна для них: $loc" else "")
+    }
+
+    fun ai(): AiAccess {
+        val c = through().newBuilder()
+            .callTimeout(15, java.util.concurrent.TimeUnit.SECONDS).build()
+        fun call(req: okhttp3.Request): Pair<Int, String>? = try {
+            c.newCall(req).execute().use { it.code to it.body?.string().orEmpty().take(800) }
+        } catch (_: Throwable) { null }
+        val ua = "Mozilla/5.0 (Linux; Android 14)"
+        val json = "application/json".toMediaTypeOrNull()
+        val res = arrayOfNulls<Pair<Int, String>>(3)
+        val reqs = listOf(
+            okhttp3.Request.Builder().url("https://api.openai.com/v1/models")
+                .header("User-Agent", ua).build(),
+            okhttp3.Request.Builder().url("https://api.anthropic.com/v1/messages")
+                .header("User-Agent", ua).header("anthropic-version", "2023-06-01")
+                .post("{}".toRequestBody(json)).build(),
+            okhttp3.Request.Builder().url("https://chatgpt.com/cdn-cgi/trace")
+                .header("User-Agent", ua).build()
+        )
+        val jobs = reqs.mapIndexed { i, r -> Thread { res[i] = call(r) }.apply { isDaemon = true; start() } }
+        jobs.forEach { it.join(16_000) }
+        val openai = res[0]?.let { (code, body) -> when {
+            code == 401 -> true
+            code == 403 && body.contains("unsupported_country") -> false
+            else -> null } }
+        val anthropic = res[1]?.let { (code, body) -> when {
+            code == 401 -> true
+            code == 403 && (body.contains("not allowed") || body.contains("forbidden")) -> false
+            else -> null } }
+        val loc = res[2]?.second?.let { Regex("(?m)^loc=(\\w+)").find(it)?.groupValues?.get(1) }.orEmpty()
+        return AiAccess(openai, anthropic, loc)
+    }
 
     data class Where(val ip: String, val country: String, val city: String, val isp: String) {
         fun short(): String = when {
