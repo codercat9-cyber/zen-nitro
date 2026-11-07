@@ -156,6 +156,15 @@ object Resolver {
         Thread(r, "zen-resolve").apply { isDaemon = true }
     }
 
+    // Последний проверенный адрес имени — без сети, для подписи на экране:
+    // провайдеры перешли с IP на имена (Триллер 06.11: mos.thriller4ag.com),
+    // и человек перестал видеть, куда на самом деле ходит нода.
+    fun lastKnown(host: String): String? {
+        if (host.isEmpty() || isIpLiteral(host)) return null
+        cache[host]?.let { return it.ip }
+        return known(host)
+    }
+
     private fun known(host: String): String? = try {
         app?.getSharedPreferences(KNOWN, 0)?.getString(host, null)
     } catch (_: Throwable) { null }

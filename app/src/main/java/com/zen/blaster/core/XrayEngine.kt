@@ -107,7 +107,15 @@ object XrayEngine {
     private val BOTH = setOf("tcp", "ws", "grpc", "http", "h2", "httpupgrade")
 
     fun bothPossible(n: Node): Boolean =
-        n.type == "VLESS" && n.transport.lowercase().ifEmpty { "tcp" } in BOTH
+        (n.type == "VLESS" && n.transport.lowercase().ifEmpty { "tcp" } in BOTH) || hy2ViaXray(n)
+
+    // HYSTERIA2 — ТОЖЕ ОБОИМИ ЯДРАМИ. Было «второго ядра для этой ноды нет»
+    // (журналы Bypass-hy2-AT/LV, FastLane), а Xray 26 умеет Hysteria2 и
+    // вдобавок шум перед рукопожатием «как у Amnezia» (см. AwgBait). Нельзя
+    // только две вещи: сертификат «не проверять» (allowInsecure в Xray 26
+    // удалён) и обфускацию gecko (в Xray её нет).
+    fun hy2ViaXray(n: Node): Boolean =
+        n.type == "Hysteria2" && !n.insecure && n.obfs.lowercase() in setOf("", "salamander")
 
     @Volatile private var proc: Process? = null
     @Volatile var lastError: String = ""; private set
@@ -395,8 +403,49 @@ object XrayEngine {
 
     // ------------------------------------------------------------ конфиг Xray
 
+    // Hysteria2 через Xray: QUIC с паролем, Salamander и прыжки по портам —
+    // маски finalmask; под бронёй сверху шум «как у Amnezia».
+    private fun buildHysteria2(n: Node, armor: Boolean, bait: List<String>): JSONObject {
+        val sni = n.sni.ifEmpty { n.addr }
+        val tls = JSONObject().put("serverName", sni)
+            .put("alpn", JSONArray(n.alpn.ifEmpty { "h3" }.split(",").map { it.trim() }))
+        val masks = JSONArray()
+        if (n.obfs.equals("salamander", true) && n.obfsPw.isNotEmpty())
+            masks.put(JSONObject().put("type", "salamander")
+                .put("settings", JSONObject().put("password", n.obfsPw)))
+        // Диапазон портов, как у sing-box (см. ConfigBuilder): «20000-50000».
+        val hop = n.hopPorts.split(",").mapNotNull { r ->
+            val t = r.trim().replace(':', '-')
+            if (Regex("^\\d+(-\\d+)?$").matches(t)) t else null
+        }
+        if (hop.isNotEmpty())
+            masks.put(JSONObject().put("type", "udphop").put("settings", JSONObject()
+                .put("mode", "intervalRemote").put("interval", "30-60")
+                .put("remotePorts", hop.joinToString(","))))
+        // Аварийным нодам шум не нужен по той же причине, что и нарезка
+        // приветствия у VLESS: их сила — быть похожими на обычный трафик.
+        if (armor && !n.wl) masks.put(AwgBait.noiseMask(bait))
+        val stream = JSONObject().put("network", "hysteria")
+            .put("hysteriaSettings", JSONObject().put("version", 2).put("auth", n.auth))
+            .put("security", "tls").put("tlsSettings", tls)
+        if (masks.length() > 0) stream.put("finalmask", JSONObject().put("udp", masks))
+        val proxy = JSONObject().put("tag", "proxy").put("protocol", "hysteria")
+            .put("settings", JSONObject().put("version", 2).put("address", n.addr).put("port", n.port))
+            .put("streamSettings", stream)
+        val inbound = JSONObject()
+            .put("tag", "socks-in").put("listen", "127.0.0.1").put("port", SOCKS_PORT)
+            .put("protocol", "socks")
+            .put("settings", JSONObject().put("udp", true).put("auth", "noauth"))
+        return JSONObject()
+            .put("log", JSONObject().put("loglevel", "info"))
+            .put("inbounds", JSONArray().put(inbound))
+            .put("outbounds", JSONArray().put(proxy)
+                .put(JSONObject().put("tag", "direct").put("protocol", "freedom")))
+    }
+
     fun buildConfig(n: Node, armor: Boolean, fp: String, viaDpi: Boolean = false,
-                    frontDomain: String = ""): JSONObject {
+                    frontDomain: String = "", bait: List<String> = emptyList()): JSONObject {
+        if (n.type == "Hysteria2") return buildHysteria2(n, armor, bait)
         // Режим белых списков: прикрываемся разрешённым доменом. Reality не
         // трогаем — там SNI связан с настройкой сервера, подмена ломает связь.
         val front = frontDomain.isNotEmpty() && n.pbk.isEmpty()

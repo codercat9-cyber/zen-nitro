@@ -65,10 +65,19 @@ class ZenVpnService : VpnService(), PlatformInterface {
         // Сервер отказал ядру sing-box в рукопожатии Reality — подъёму наверху
         // нет смысла ждать таймаута, второе ядро можно пробовать сразу.
         @Volatile var onCoreReject: ((String) -> Unit)? = null
+        // Служба сама перешла на другую ноду (ключ «адрес:порт|имя») —
+        // приложению обновить выбор на экране.
+        @Volatile var onNodeSwitch: ((String) -> Unit)? = null
         // Канал этой попытки уже доказан (замер через ядро прошёл), идут
         // только дополнительные проверки. Таймер отката наверху в этот
         // момент рвать туннель не должен.
         @Volatile var channelProven = false
+
+        // ШТОРКА ТЕЛЕФОНА — то, что видно в уведомлении и на плитке быстрых
+        // настроек: служба на переднем плане, нода и что с ней сейчас.
+        @Volatile var active = false; private set
+        @Volatile var shadeNode = ""; private set
+        @Volatile var shadeState = ""; private set
     }
 
     private var boxService: BoxCore? = null
@@ -169,9 +178,11 @@ class ZenVpnService : VpnService(), PlatformInterface {
             refusal = it
             say("🔑 ${it.replaceFirstChar { c -> c.uppercase() }}")
         }
-        // Сброс до ноды — после трёх подряд, одна строка бывает случайной.
+        // Сброс до ноды — после двух: одна строка бывает случайной, а Xray через
+        // mux пишет по строке на попытку раз в ~5 с (эмулятор 06.11: за 9 с
+        // попытки — две строки, и при пороге «три» сброс так и не назвали).
         if (refusal.isEmpty()) com.zen.blaster.core.CoreRefusal.refusedTo(clean)?.let { target ->
-            if (++refusedHits >= 3) {
+            if (++refusedHits >= 2) {
                 refusal = com.zen.blaster.core.CoreRefusal.refusedText(target)
                 say("⛔ ${refusal.replaceFirstChar { c -> c.uppercase() }}")
             }
@@ -380,7 +391,10 @@ class ZenVpnService : VpnService(), PlatformInterface {
         // подъёма видит, что он больше не нужен, и не лезет ни в уведомление,
         // ни в состояние.
         val gen = epoch.incrementAndGet()
+        up = false
         startForeground(NOTIF_ID, notif("Подключение…"))
+        active = true
+        watchShade()
         // ВАЖНО: подъём ядра (Libbox.newService/start, ByeDPI) — тяжёлый и
         // блокирующий. Сервис живёт в том же процессе, что и UI, поэтому на
         // главном потоке он замораживает анимацию кольца. Уводим в фон.
@@ -516,6 +530,7 @@ class ZenVpnService : VpnService(), PlatformInterface {
                 if (!alive(gen)) return
                 // Ядро поднялось, а канала нет: сервер не ответил на рукопожатие
                 // или ответ до нас не дошёл. Самый частый вид отказа в блокировку.
+                lastRefused = refusal.isNotEmpty()
                 com.zen.blaster.core.Blackbox.outcome(false, refusal.ifEmpty {
                     "ядро поднялось, но канал не отвечает (сервер молчит либо ответ режут)" })
                 Stats.stage.value = ""
@@ -561,9 +576,16 @@ class ZenVpnService : VpnService(), PlatformInterface {
             everUp = true
             reconnects = 0                 // связь есть — счётчик неудач обнуляем
             certStreak = 0
+            failSince = 0L; failedNodes.clear(); hops = 0; lastRefused = false
+            up = true
             onState?.invoke(true)          // ← теперь «Подключено» честное
             askWhereWeAre(gen)
             checkDnsQuietly()
+            // Ядра — сами, как облачное обновление: и у тех, кто неделями не
+            // открывает приложение, а только держит туннель (см. CoreAuto).
+            kotlin.concurrent.thread(name = "zen-cores", isDaemon = true) {
+                try { com.zen.blaster.core.CoreAuto.run(this) { say(it) } } catch (_: Throwable) {}
+            }
             com.zen.blaster.core.Blackbox.outcome(true,
                 if (verifyNote.isEmpty()) "канал проверен" else "канал есть, но $verifyNote")
             startStats(tag)
@@ -750,6 +772,11 @@ class ZenVpnService : VpnService(), PlatformInterface {
         lastNotifKey = ""
         // Снимаем авто-сброс DNS при смене сети: без туннеля он ни к чему.
         com.zen.blaster.core.DnsCacheManager.stopWatching(this)
+        up = false
+        active = false
+        shadeNode = ""; shadeState = ""
+        com.zen.blaster.core.Prefs(this).connectedKey = ""
+        pokeTile()
         onState?.invoke(false)
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -858,6 +885,7 @@ class ZenVpnService : VpnService(), PlatformInterface {
         // замеры означают, что туннель фактически мёртв, хотя формально поднят.
         Thread({
             var misses = 0
+            var missSince = 0L
             var noNetLogged = false
             var trafficLogged = false
             while (statsRunning) {
@@ -936,6 +964,7 @@ class ZenVpnService : VpnService(), PlatformInterface {
                     } else {
                         noNetLogged = false
                         misses++
+                        if (misses == 1) missSince = System.currentTimeMillis()
                         if (misses >= 2) Stats.stage.value = "Канал молчит — восстанавливаю"
                         // Второй промах подряд при живой сети — пора будить
                         // радио: на сотовой связи чаще всего это модем уснул
@@ -965,12 +994,23 @@ class ZenVpnService : VpnService(), PlatformInterface {
                         // покупался. Теперь на медленном мобильном канале нужно
                         // двадцать промахов подряд, и при этом ни одного байта
                         // трафика между ними — только тогда туннель правда мёртв.
-                        val limit = 5 * pat
-                        if (misses >= limit) {
+                        // ПОРОГ — ПО ВРЕМЕНИ, А НЕ ПО ЧИСЛУ ЗАМЕРОВ.
+                        //
+                        // Было «5 × терпение» замеров, а каждый замер и так
+                        // растянут терпением (двойной, по 5–20 с) — на сотовой
+                        // связи мёртвый канал держали ~4,5 минуты, прежде чем
+                        // что-то делать; на эмуляторе 06.11 — 80 с на Wi-Fi.
+                        // Держим, как просил человек, «а вдруг подымется», но
+                        // не дольше: 45 с тишины (на медленной сети до 90) и
+                        // не меньше трёх промахов подряд при живой сети и без
+                        // единого байта трафика.
+                        val holdMs = (30_000L * pat).coerceIn(45_000L, 90_000L)
+                        if (misses >= 3 && System.currentTimeMillis() - missSince >= holdMs) {
                             say("⚠️ Канал не отвечает при живой сети — переподключаюсь")
                             com.zen.blaster.core.Blackbox.note(
                                 "💔 «${Stats.server.value}» (${Stats.mode.value}) сорвалась " +
-                                "после ${uptimeText()} работы: $limit замеров подряд мимо " +
+                                "после ${uptimeText()} работы: $misses замеров подряд мимо за " +
+                                "${(System.currentTimeMillis() - missSince) / 1000} с " +
                                 "и ни байта трафика · " + com.zen.blaster.core.NetInfo.line(this))
                             misses = 0
                             reconnect()
@@ -1138,13 +1178,21 @@ class ZenVpnService : VpnService(), PlatformInterface {
                 tls?.optJSONObject("reality")?.optBoolean("enabled") == true)
         } else if (xray != null) {
             val x = org.json.JSONObject(xray).getJSONArray("outbounds").getJSONObject(0)
-            val v = x.getJSONObject("settings").getJSONArray("vnext").getJSONObject(0)
-            val ss = x.optJSONObject("streamSettings")
-            val sec = ss?.optString("security").orEmpty()
-            val sni = (ss?.optJSONObject("realitySettings") ?: ss?.optJSONObject("tlsSettings"))
-                ?.optString("serverName").orEmpty()
-            LineTarget(v.getString("address"), v.getInt("port"), sni, false, sec == "tls" || sec == "reality",
-                sec == "reality")
+            // Hysteria2 через Xray: адрес в settings, а сам порт живёт по UDP.
+            if (x.optString("protocol") == "hysteria") {
+                val st = x.getJSONObject("settings")
+                val sni = x.optJSONObject("streamSettings")?.optJSONObject("tlsSettings")
+                    ?.optString("serverName").orEmpty()
+                LineTarget(st.getString("address"), st.getInt("port"), sni, true, true)
+            } else {
+                val v = x.getJSONObject("settings").getJSONArray("vnext").getJSONObject(0)
+                val ss = x.optJSONObject("streamSettings")
+                val sec = ss?.optString("security").orEmpty()
+                val sni = (ss?.optJSONObject("realitySettings") ?: ss?.optJSONObject("tlsSettings"))
+                    ?.optString("serverName").orEmpty()
+                LineTarget(v.getString("address"), v.getInt("port"), sni, false, sec == "tls" || sec == "reality",
+                    sec == "reality")
+            }
         } else null
     } catch (_: Throwable) { null }
 
@@ -1162,8 +1210,66 @@ class ZenVpnService : VpnService(), PlatformInterface {
         }
     }
 
+    // ДРУГАЯ НОДА, КОГДА СВОЯ НЕ ВСТАЁТ.
+    //
+    // Пока туннель хоть раз поднялся, восстановление было делом службы — а
+    // служба умела только повторять ту же ноду. Журнал 05–06.11: вход NoV
+    // лёг целиком, и «🇺🇸 Каскад NoV-US» поднимали 3957 раз за шесть часов,
+    // хотя живые ноды на других входах были в списке. Теперь: своя нода не
+    // встаёт 30 с (держим её столько, сколько просил человек: «а вдруг
+    // подымется») и три попытки при живой сети — уходим на следующую тем же
+    // порядком, что у каскада в приложении (см. NodeConfig.next). Не больше
+    // восьми переходов за один обрыв: дальше держимся последней с паузой.
+    @Volatile private var failSince = 0L
+    private val failedNodes = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+    @Volatile private var hops = 0
+    @Volatile private var lastRefused = false
+
+    private fun switchNodeIfStuck(prefs: com.zen.blaster.core.Prefs) {
+        val since = failSince
+        if (since <= 0L || reconnects < 3 || hops >= 8) return
+        val secs = (System.currentTimeMillis() - since) / 1000
+        if (secs < 30 || !hasUnderlyingNet()) return
+        val curKey = prefs.selectedKey.substringBefore('|')
+        if (curKey.isEmpty()) return
+        failedNodes += curKey
+        // Отказ (сброс, пароль) — скорее всего, лёг весь вход: его соседей
+        // пробуем после всех остальных.
+        val deadEntry = if (lastRefused) curKey.substringBeforeLast(':') else null
+        // Первая из очереди, что отвечает мимо туннеля (не больше восьми
+        // проверок по 2 с); не ответившие — в пробованные, чтобы не крутить их.
+        var next: com.zen.blaster.model.Node? = null
+        for (c in com.zen.blaster.core.NodeConfig.ranked(this, prefs, failedNodes, deadEntry).take(8)) {
+            if (com.zen.blaster.core.NodeConfig.reachable(c)) { next = c; break }
+            failedNodes += com.zen.blaster.core.NodeConfig.traitKey(c)
+            com.zen.blaster.core.Blackbox.note("   🔀 «${c.name}» ${c.addr}:${c.port} не отвечает мимо туннеля — пропускаю")
+        }
+        if (next == null) return
+        val built = try { com.zen.blaster.core.NodeConfig.build(this, prefs, next) } catch (t: Throwable) {
+            say("⚠️ Не собрал конфиг «${next.name}»: ${t.message}"); failedNodes += com.zen.blaster.core.NodeConfig.traitKey(next); return
+        }
+        val was = Stats.server.value
+        prefs.rememberCarrierLoss(com.zen.blaster.core.NetInfo.carrierKey(this), curKey, lost = true)
+        prefs.lastConfig = built.first
+        prefs.lastXray = built.second
+        prefs.lastServerName = next.name
+        prefs.selectedKey = com.zen.blaster.core.NodeConfig.keyOf(next)
+        prefs.connectedKey = prefs.selectedKey
+        Stats.server.value = next.name
+        Stats.mode.value = if (prefs.dpiEnabled) "VPN + DPI" else next.badge()
+        say("🔀 «$was» не встаёт $secs с ($reconnects попыт.) — перехожу на «${next.name}»")
+        com.zen.blaster.core.Blackbox.note("🔀 сторож: «$was» не встаёт $secs с, $reconnects попыток" +
+            (if (lastRefused) ", отказ" else "") + " — перехожу на «${next.name}» ${next.addr}:${next.port}")
+        failSince = System.currentTimeMillis()
+        hops++
+        reconnects = 1
+        lastRefused = false
+        onNodeSwitch?.invoke(prefs.selectedKey)
+    }
+
     private fun reconnect() {
         val prefs = com.zen.blaster.core.Prefs(this)
+        up = false        // шторка — сразу «Переподключаюсь», а не «Подключено»
         // СБРОС КЕША АДРЕСОВ ПРИ ПЕРЕПОДКЛЮЧЕНИИ.
         //
         // Обрыв часто совпадает с тем, что нода переехала: провайдеры крутят
@@ -1215,6 +1321,10 @@ class ZenVpnService : VpnService(), PlatformInterface {
         }
         if (reconnects == 5 && everUp)
             say("↻ Связь не возвращается — продолжаю пробовать, пока не отключите")
+        // Настоящий обрыв (туннель стоял и упал) или очередная неудачная
+        // попытка вернуться — разные вещи: удача обнуляет счётчик.
+        val realDrop = reconnects == 0
+        if (realDrop) { failSince = System.currentTimeMillis(); failedNodes.clear(); hops = 0 }
         reconnects++
 
         // Разбор почерка обрыва. На мобильной сети пачка обрывов подряд — это
@@ -1227,7 +1337,10 @@ class ZenVpnService : VpnService(), PlatformInterface {
         } catch (_: Throwable) { false }
         val badge = Stats.mode.value
         val quicNode = badge.contains("Hy2") || badge.contains("Hysteria") || badge.contains("TUIC")
-        if (com.zen.blaster.core.PdpGuard.onDrop(mobile, System.currentTimeMillis())) {
+        // Считаем только НАСТОЯЩИЕ обрывы. Наши же неудачные попытки
+        // вернуться шли сюда как «обрывы оператора»: журнал 06.11 — «224 за
+        // 10 минут — похоже, сессию гасит оператор», а гас вход ноды.
+        if (realDrop && com.zen.blaster.core.PdpGuard.onDrop(mobile, System.currentTimeMillis())) {
             say("📵 " + com.zen.blaster.core.PdpGuard.lastVerdict)
             say("   " + com.zen.blaster.core.PdpGuard.advice(quicNode))
         }
@@ -1235,12 +1348,6 @@ class ZenVpnService : VpnService(), PlatformInterface {
         // Возвращаемся с НОВЫМ отпечатком TLS. Готовый конфиг несёт тот, что
         // выбрали при сборке, и без подмены мы стучались бы одним и тем же
         // приветствием после каждого обрыва.
-        val cfg = com.zen.blaster.core.PdpGuard.freshenFingerprint(prefs.lastConfig)
-        val dpi = prefs.lastDpi
-        val strat = prefs.dpiStrategy
-        xrayConfig = prefs.lastXray.ifEmpty { null }
-        probeLineFromConfig(cfg, xrayConfig)
-
         kotlin.concurrent.thread(name = "zen-reconnect", isDaemon = true) {
             // Гасим всё старое и держим паузу: сети нужно время встать.
             statsRunning = false
@@ -1274,6 +1381,16 @@ class ZenVpnService : VpnService(), PlatformInterface {
             val step = reconnects.coerceAtMost(8)
             Thread.sleep(1500L * step + (0..750L * step).random())
 
+            // Другая нода — здесь, в своём потоке: выбор с проверкой
+            // кандидатов занимает до 16 с сети, а reconnect() зовут и из
+            // потока логов ядра, который держать нельзя.
+            if (everUp) switchNodeIfStuck(prefs)
+            val cfg = com.zen.blaster.core.PdpGuard.freshenFingerprint(prefs.lastConfig)
+            val dpi = prefs.lastDpi
+            val strat = prefs.dpiStrategy
+            xrayConfig = prefs.lastXray.ifEmpty { null }
+            probeLineFromConfig(cfg, xrayConfig)
+
             starting.set(false)
             val gen = epoch.incrementAndGet()
             // Возврат после обрыва — такая же попытка, как первая, и разбирать
@@ -1290,8 +1407,13 @@ class ZenVpnService : VpnService(), PlatformInterface {
                             " · ${com.zen.blaster.core.PdpGuard.lastVerdict}" else "")
                 )
             )
+            // Счётчик здесь НЕ обнуляем: при удаче его обнуляет сам подъём
+            // (там, где канал проверен). Здесь стояло «if (running)
+            // reconnects = 0» — а при провале startVpnBlocking успевает сам
+            // позвать reconnect(), тот прибавляет счётчик, и этот поток тут же
+            // его стирал. Журнал 05–06.11: 3957 попыток подряд на одну ноду
+            // каждые 2–3 с, все — «попытка 0 из 5», пауза так и не росла.
             startVpnBlocking(cfg, dpi, strat, gen)
-            if (running) reconnects = 0
         }
     }
 
@@ -1848,6 +1970,64 @@ class ZenVpnService : VpnService(), PlatformInterface {
     // Уведомление в шторке: сервер + режим, скорость ↓/↑, пинг, время сессии.
     @Volatile private var channelReady = false
 
+    // Работает ли туннель прямо сейчас (канал проверен и не сорвался).
+    @Volatile private var up = false
+
+    // Что сказать в шторке одной строкой.
+    private fun shadeLine(): String {
+        val st = Stats.stage.value
+        return when {
+            blocked && !up -> "🔒 Трафик закрыт — восстанавливаю туннель"
+            st.startsWith("Нет сети") -> "Нет сети — жду"
+            st.startsWith("Канал молчит") -> "Канал молчит — восстанавливаю"
+            st.startsWith("Переподключаюсь") -> st
+            st.startsWith("Нода не принимает") -> st
+            !up -> if (st.isNotEmpty() && st != "Готово") "Подключаюсь · $st" else "Подключаюсь…"
+            else -> "Подключено"
+        }
+    }
+
+    // ШТОРКА ДОЛЖНА СОВПАДАТЬ С ТЕМ, ЧТО ПОДКЛЮЧЕНО.
+    //
+    // Уведомление обновлялось только из цикла замеров — а он стоит, пока
+    // туннель поднимается, переподключается или сторож переходит на другую
+    // ноду. В шторке висели старая нода и старые скорости. Теперь: сменилась
+    // нода, стадия или «работает/нет» — уведомление и плитка быстрых настроек
+    // перерисовываются сразу (проверка раз в 0,4 с, без сети и без ядра).
+    @Volatile private var shadeWatching = false
+    private fun watchShade() {
+        if (shadeWatching) return
+        shadeWatching = true
+        kotlin.concurrent.thread(name = "zen-shade", isDaemon = true) {
+            var last = ""
+            try {
+                while (active) {
+                    val node = Stats.server.value
+                    val line = shadeLine()
+                    val key = "$node|$line|${Stats.mode.value}"
+                    if (key != last) {
+                        last = key
+                        shadeNode = node; shadeState = line
+                        try {
+                            (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
+                                .notify(NOTIF_ID, notif(null))
+                            lastNotifKey = ""
+                        } catch (_: Throwable) {}
+                        pokeTile()
+                    }
+                    Thread.sleep(400)
+                }
+            } finally { shadeWatching = false }
+        }
+    }
+
+    private fun pokeTile() {
+        try {
+            android.service.quicksettings.TileService.requestListeningState(this,
+                android.content.ComponentName(this, ZenTileService::class.java))
+        } catch (_: Throwable) {}
+    }
+
     private fun notif(overrideText: String?): Notification {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !channelReady) {
@@ -1886,12 +2066,16 @@ class ZenVpnService : VpnService(), PlatformInterface {
 
         val srv = Stats.server.value.ifEmpty { "ZEN NITRO" }
         val pingTxt = if (Stats.shownPing.value > 0) "${Stats.shownPing.value} мс" else "—"
-        val text = overrideText ?: buildString {
+        val state = shadeLine()
+        // Скорости — только когда туннель правда работает. Во время подъёма,
+        // переподключения или без сети здесь висели старые цифры старой ноды,
+        // и шторка врала «всё хорошо».
+        val text = overrideText ?: if (state != "Подключено") state else buildString {
             append("↓ ").append(Stats.fmtSpeed(Stats.down.value))
             append("   ↑ ").append(Stats.fmtSpeed(Stats.up.value))
             append("   •   ").append(pingTxt)
         }
-        val sub = if (overrideText != null) Stats.mode.value
+        val sub = if (overrideText != null || state != "Подключено") Stats.mode.value
                   else "${Stats.mode.value} · ${Stats.fmtDuration()}"
 
         return NotificationCompat.Builder(this, CHANNEL)

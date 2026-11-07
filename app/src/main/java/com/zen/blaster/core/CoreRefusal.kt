@@ -40,7 +40,10 @@ object CoreRefusal {
     fun refusedTo(line: String): String? {
         if (line.contains("dns:") || line.contains("exchange failed")) return null
         if (!line.contains("connection refused")) return null
-        if (!line.contains("[proxy]") && !line.contains("process DNS packet")) return null
+        // sing-box: «outbound/vless[proxy]»; Xray: «proxy/vless/outbound»
+        // (прямой выход Xray — freedom — не про ноду).
+        val xrayNode = Regex("proxy/(vless|vmess|trojan|shadowsocks|hysteria\\w*)/outbound").containsMatchIn(line)
+        if (!line.contains("[proxy]") && !line.contains("process DNS packet") && !xrayNode) return null
         return Regex("""dial tcp ([0-9a-fA-F.:\[\]]+): connect: connection refused""")
             .find(line)?.groupValues?.get(1)
     }

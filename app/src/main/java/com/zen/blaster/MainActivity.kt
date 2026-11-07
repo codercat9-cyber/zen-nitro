@@ -289,7 +289,14 @@ class MainActivity : ComponentActivity() {
     // на первую ноду списка, а в журнал шло «прежний сервер пропал» — хотя
     // сервер никуда не девался. Отсюда и жалоба, что серверы сами сбиваются.
     private fun restoreSelection() {
-        val key = prefs.selectedKey
+        // ПОКА ТУННЕЛЬ ЖИВ — ЭКРАН ПОКАЗЫВАЕТ ТУ НОДУ, ЧЕРЕЗ КОТОРУЮ ОН ИДЁТ.
+        //
+        // 06.11, Xiaomi: на главной «AI🤖», а туннель и шторка — «Lockpick〽».
+        // Выбранной ноды не оказалось в кэше при запуске, выбор молча упал на
+        // первую в списке (её и подключили), а ключ выбора остался старым —
+        // догрузились подписки, и выбор по старому ключу вернулся на AI🤖.
+        val live = connState.intValue != 0 && ZenVpnService.active
+        val key = if (live && prefs.connectedKey.isNotEmpty()) prefs.connectedKey else prefs.selectedKey
         if (key.isEmpty()) { if (selected.intValue >= nodes.size) selected.intValue = 0; return }
         var i = nodes.indexOfFirst { keyOf(it) == key }
         if (i < 0) {
@@ -392,6 +399,8 @@ class MainActivity : ComponentActivity() {
 
         ZenVpnService.onLog = { runOnUiThread { log(it) } }
         ZenVpnService.onCoreReject = { coreRejected = true }
+        // Служба сама ушла на другую ноду — показать это в списке и на главной.
+        ZenVpnService.onNodeSwitch = { runOnUiThread { restoreSelection(); pingTick.intValue++ } }
         ZenVpnService.onState = { on -> runOnUiThread {
             connState.intValue = if (on) 2 else 0
             // ТУННЕЛЬ ПОДНЯЛСЯ — ЗНАЧИТ НОДА ЖИВАЯ, ЧЕМ БЫ ОНА НИ ОТВЕЧАЛА
@@ -1414,29 +1423,7 @@ class MainActivity : ComponentActivity() {
     //  Поэтому: на медленном мобильном канале Brutal не заявляем совсем —
     //  BBR сам нащупает потолок. На обычной сотовой связи заявляем не больше
     //  того, что система намерила. На Wi-Fi и хорошем LTE — как настроено.
-    private fun brutal(): Pair<Int, Int> {
-        if (!prefs.hyBoost) return 0 to 0
-        val want = prefs.hyDownMbps to prefs.hyUpMbps
-        if (com.zen.blaster.core.NetInfo.slowMobile(this)) return 0 to 0
-        val kbps = com.zen.blaster.core.NetInfo.downKbps(this)
-        val mobile = com.zen.blaster.core.NetInfo.snapshot(this).mobile
-        // Система скорость не знает. Здесь стояло «не выдумываем» — и тут же
-        // возвращались 100↓/20↑ из настроек, то есть ровно выдуманное. Журнал
-        // 20.10, Tele2: «Hysteria2 в режиме Brutal: 100↓ / 20↑», нода не
-        // встала. На сотовой связи без замера — BBR: он сам найдёт потолок.
-        // Вслепую заявленный Brutal — это ровный плотный UDP-поток, который
-        // и сам себя топит, и сильнее всего заметен в соте (см. PdpGuard).
-        if (kbps <= 0) return if (mobile) 0 to 0 else want
-        // Потолок ставим и на проводе тоже. Заявить 100 Мбит/с на домашнем
-        // канале в 68 — это всё та же ложь ядру, просто не смертельная:
-        // Brutal будет давить сверх того, что канал уносит, и стабильно
-        // терять хвост. Берём с запасом вниз, потому что переоценить канал
-        // в Brutal опаснее, чем недооценить. Оценка сотовой сети у Android —
-        // табличная по типу связи и почти всегда завышена: там запас больше.
-        val cap = (kbps * (if (mobile) 3 else 4) / 5 / 1000).coerceAtLeast(1)
-        return if (want.first <= cap) want
-               else cap to (want.second * cap / want.first).coerceAtLeast(1)
-    }
+    private fun brutal(): Pair<Int, Int> = com.zen.blaster.core.NodeConfig.brutal(this, prefs)
 
     // forceXray: null — выбрать ядро самим, true/false — поднимать заданным.
     // Второе нужно откату: когда одно ядро не справилось, вторую попытку
@@ -1462,6 +1449,8 @@ class MainActivity : ComponentActivity() {
                 node.copy(insecure = true) else node
         }
         if (vpnOn && n == null) { log("❌ Сервер не выбран"); return }
+        // Подключаем ровно эту ноду — она и есть выбор, и она же в туннеле.
+        if (vpnOn && n != null) { prefs.selectedKey = keyOf(n); prefs.connectedKey = keyOf(n) }
         if (vpnOn && n != null && !n.supported()) {
             log("❌ ${n.badge()}: транспорт ${n.transport} не поддерживается ни одним из ядер.")
             connState.intValue = 0
@@ -1507,7 +1496,7 @@ class MainActivity : ComponentActivity() {
         // вставшие только через Xray, — урок для всего входа.
         val xr = prefs.xrayNodes()
         val selfXray = n != null && traitKey(n) in xr
-        val neighbours = n?.let { m -> xr.count { it != traitKey(m) && it.substringBeforeLast(':') == m.addr } } ?: 0
+        val neighbours = n?.let { com.zen.blaster.core.NodeConfig.xrayNeighbours(prefs, it) } ?: 0
         val remembered = n != null && XrayEngine.bothPossible(n) && (selfXray || neighbours >= 2)
         val autoXray = vpnOn && n != null && (XrayEngine.handles(n) || remembered) && XrayEngine.available(this)
         if (remembered && forceXray == null && prefs.tunnelEngine == 0)
@@ -1589,12 +1578,18 @@ class MainActivity : ComponentActivity() {
             else -> log("⚪ Подменяю имя на $front — сработает, если сервер принимает любое")
         }
         pendingXray = if (viaXray) {
-            log("🧩 Транспорт ${n!!.transport.uppercase()} → ядро Xray")
+            val bait = com.zen.blaster.core.AwgBait.fromProfiles(prefs.awgProfiles())
+            if (n!!.type == "Hysteria2")
+                log("🧩 Hysteria2 → ядро Xray" + (if (prefs.armor && !n.wl)
+                    " · шум перед рукопожатием как у Amnezia" +
+                        (if (bait.isNotEmpty()) " (приманки I1–I5 из AWG-профиля: ${bait.size})" else "")
+                    else ""))
+            else log("🧩 Транспорт ${n.transport.uppercase()} → ядро Xray")
             // Аварийную ноду через ByeDPI не пускаем: он корёжит то самое
             // приветствие, которое мы делаем похожим на обычный поход на сайт.
             // На стороне sing-box это уже так — приводим Xray к тому же.
             XrayEngine.buildConfig(n, prefs.armor, fp,
-                viaDpi = chainOn && !n.wl, frontDomain = front).toString()
+                viaDpi = chainOn && !n.wl, frontDomain = front, bait = bait).toString()
         } else null
 
         val proxyMode = prefs.proxyMode
@@ -1899,6 +1894,10 @@ class MainActivity : ComponentActivity() {
                         com.zen.blaster.core.Blackbox.note("↪ каскад: «${cur?.name}» → «${nn.name}» ($why)")
                         selected.intValue = next
                         prefs.selectedServer = next
+                        // И ключ: по нему выбор восстанавливается после
+                        // «обновить» и по нему сторож службы знает, какая нода
+                        // сейчас в туннеле. Без него выбор прыгал назад.
+                        prefs.selectedKey = keyOf(nn)
                     } else {
                         log("↻ Захожу на новый круг — остановить можно кнопкой.")
                         com.zen.blaster.core.Blackbox.note("↻ каскад пройден, начинаю заново")
@@ -1980,30 +1979,10 @@ class MainActivity : ComponentActivity() {
         val n = nodes.getOrNull(selected.intValue) ?: return
         if (!n.supported() || !prefs.vpnEnabled) return
         try {
-            val dpiOn = prefs.dpiEnabled
-            val viaXray = XrayEngine.handles(n) && XrayEngine.available(this)
-            val fp = if (prefs.armor) ConfigBuilder.pickFingerprint() else ""
-            val front = when {
-                n.whitelistNative() -> ""
-                prefs.whitelistMode -> prefs.whitelistDomain.trim()
-                else -> ""
-            }
-            prefs.lastXray = if (viaXray)
-                XrayEngine.buildConfig(n, prefs.armor, fp,
-                    viaDpi = prefs.chainVpnViaDpi && dpiOn && !n.wl, frontDomain = front).toString()
-            else ""
-            prefs.lastConfig = ConfigBuilder.build(
-                n, prefs.geoRouting, prefs.ipv6, true, dpiOn, prefs.geoDir(), prefs.armor, viaXray,
-                prefs.proxyMode, front,
-                hyDown = brutal().first,
-                hyUp = brutal().second,
-                slowLink = com.zen.blaster.core.NetInfo.slowMobile(this),
-                bypassApps = if (prefs.geoRouting) prefs.splitApps() else emptySet(),
-                lanProxy = prefs.lanProxy, lanUser = prefs.lanUser, lanPass = prefs.lanPass,
-                dohUrl = prefs.dnsUrl(), directDohUrl = prefs.preDnsUrl(),
-                chainViaDpi = prefs.chainVpnViaDpi && dpiOn
-            ).toString()
-            prefs.lastDpi = dpiOn
+            val (box, xray) = com.zen.blaster.core.NodeConfig.build(this, prefs, n)
+            prefs.lastXray = xray
+            prefs.lastConfig = box
+            prefs.lastDpi = prefs.dpiEnabled
             prefs.lastServerName = n.name
         } catch (t: Throwable) {
             // Не смогли — оставляем прежний конфиг: он хотя бы рабочий.
@@ -2062,9 +2041,9 @@ class MainActivity : ComponentActivity() {
                         horizontalArrangement = Arrangement.SpaceEvenly,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        NavIcon(Icons.Outlined.Home, tab == 0) { tab = 0 }
-                        NavIcon(Icons.Outlined.Settings, tab == 1) { tab = 1 }
-                        NavIcon(Icons.Outlined.Description, tab == 2) { tab = 2 }
+                        NavIcon(Icons.Outlined.Home, "Главная", tab == 0) { tab = 0 }
+                        NavIcon(Icons.Outlined.Settings, "Настройки", tab == 1) { tab = 1 }
+                        NavIcon(Icons.Outlined.Description, "Журнал", tab == 2) { tab = 2 }
                     }
                 }
             }
@@ -3075,8 +3054,12 @@ class MainActivity : ComponentActivity() {
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Column(Modifier.weight(1f)) {
+                                // Имя — одно на всю ширину, в одну строку без
+                                // переноса по словам. Плашка метки стояла перед
+                                // ним и съедала полстроки: «Германия_A…»,
+                                // «Нидерланды…», а с переносом — один флаг.
+                                // Плашка теперь во второй строке.
                                 Row(verticalAlignment = Alignment.CenterVertically) {
-                                    nodeLabels.value[n.name]?.let { LabelChip(it, 11) }
                                     Text(n.name,
                                         color = when {
                                             !ok -> ZenGray
@@ -3084,8 +3067,12 @@ class MainActivity : ComponentActivity() {
                                             active -> ZenCyan
                                             else -> Color.White
                                         },
-                                        fontSize = 16.sp, maxLines = 1)
+                                        fontSize = 16.sp, maxLines = 1, softWrap = false,
+                                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f, fill = false))
                                 }
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                nodeLabels.value[n.name]?.let { LabelChip(it, 10) }
                                 Text(
                                     when {
                                         // ЖИВАЯ НОДА НЕ БЫВАЕТ «ПРОПАВШЕЙ».
@@ -3125,7 +3112,11 @@ class MainActivity : ComponentActivity() {
                                             "${n.badge()} · не отвечает на пробы, но работала ${goneDate(n.lastOkAt)}"
                                         n.ping < 0 && n.silentTries >= Node.SILENT_LIMIT ->
                                             "${n.badge()} · молчит ${n.silentTries}-й замер подряд"
-                                        else -> "${n.badge()} · ${n.addr}"
+                                        // IP — раньше имени: не влезет — обрежется
+                                        // имя, а адрес останется виден.
+                                        else -> "${n.badge()} · " +
+                                            (com.zen.blaster.core.Resolver.lastKnown(n.addr)?.let { "$it · " } ?: "") +
+                                            n.addr
                                     },
                                     color = when {
                                         n.gone -> Color(0xFFE87A3A)
@@ -3140,8 +3131,11 @@ class MainActivity : ComponentActivity() {
                                     },
                                     // Две строки: «нет в свежей выдаче, но
                                     // отвечает» в одну не влезало и рвалось.
-                                    fontSize = 12.sp, maxLines = 2
+                                    fontSize = 12.sp, maxLines = 2,
+                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f)
                                 )
+                                }
                             }
                             Text(
                                 when {
@@ -3247,10 +3241,13 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun NavIcon(icon: androidx.compose.ui.graphics.vector.ImageVector, active: Boolean, onClick: () -> Unit) {
+    // Подпись вкладки — для экранного чтеца (TalkBack) и для автотеста
+    // ядер на ПК (tools/zen-cores), который находит вкладку по ней.
+    private fun NavIcon(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String,
+                        active: Boolean, onClick: () -> Unit) {
         val ringColor = if (connState.intValue == 0) ZenCyan else ZenRed
         Icon(
-            imageVector = icon, contentDescription = null,
+            imageVector = icon, contentDescription = label,
             tint = if (active) ringColor else ZenGray,
             modifier = Modifier.size(26.dp).clickable(
                 interactionSource = remember { MutableInteractionSource() }, indication = null
@@ -3267,76 +3264,88 @@ class MainActivity : ComponentActivity() {
         val isAwg = engine.intValue == 1
         val title = if (isAwg) awg?.name ?: "Импортируйте конфиг" else n?.name ?: "Выберите сервер"
         val subtitle = if (isAwg) awg?.let { "${it.badge()} | ${it.host}" } ?: "нет профилей"
-                       else n?.let { "${it.badge()} | ${it.addr}" } ?: "нет данных"
-        Column(Modifier.fillMaxSize()) {
-            // Кольцо: центр примерно на 36% высоты, как у Amnezia.
-            // Кнопка обновления живёт вплотную под кольцом и появляется, только
-            // когда обновление действительно есть, — в остальное время колонка
-            // состоит из одного кольца, и оно стоит ровно там же, где стояло.
-            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    ConnectRing()
-                    UpdateButton()
+                       else n?.let { "${it.badge()} | " +
+                           (com.zen.blaster.core.Resolver.lastKnown(it.addr)?.let { ip -> "$ip · " } ?: "") + it.addr }
+                           ?: "нет данных"
+        // БОКОМ ВЫСОТЫ НЕ ХВАТАЕТ. Телефон в альбомной ориентации (или
+        // маленькое окно) — и место под кольцо «всё, что осталось» сжималось
+        // до нуля: 06.11 на Xiaomi Zen четыре раза падал при открытии
+        // («ending radius must be > 0»), воспроизводится поворотом экрана.
+        // Тесно — главная прокручивается, кольцо остаётся своего размера.
+        BoxWithConstraints(Modifier.fillMaxSize()) {
+            val tight = maxHeight < 520.dp
+            Column(if (tight) Modifier.fillMaxSize().verticalScroll(rememberScrollState())
+                   else Modifier.fillMaxSize()) {
+                // Кольцо: центр примерно на 36% высоты, как у Amnezia.
+                // Кнопка обновления живёт вплотную под кольцом и появляется, только
+                // когда обновление действительно есть, — в остальное время колонка
+                // состоит из одного кольца, и оно стоит ровно там же, где стояло.
+                Box(if (tight) Modifier.fillMaxWidth().padding(vertical = 12.dp)
+                    else Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        ConnectRing()
+                        UpdateButton()
+                    }
                 }
-            }
 
-            // Строка статуса (у Amnezia тут «Раздельное туннелирование»)
-            StatusRow()
+                // Строка статуса (у Amnezia тут «Раздельное туннелирование»)
+                StatusRow()
 
-            Spacer(Modifier.height(10.dp))
-            ModeChips()
+                Spacer(Modifier.height(10.dp))
+                ModeChips()
 
-            Spacer(Modifier.height(14.dp))
+                Spacer(Modifier.height(14.dp))
 
-            // Нижняя карточка-шторка с сервером — по тапу открывается выбор
-            Surface(
-                color = ZenCard,
-                shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp),
-                modifier = Modifier.fillMaxWidth().clickable { showPicker.value = true }
-            ) {
-                Column(
-                    Modifier.fillMaxWidth().padding(top = 10.dp, bottom = 26.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
+                // Нижняя карточка-шторка с сервером — по тапу открывается выбор
+                Surface(
+                    color = ZenCard,
+                    shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp),
+                    modifier = Modifier.fillMaxWidth().clickable { showPicker.value = true }
                 ) {
-                    // «грабер»
-                    Box(Modifier.width(34.dp).height(4.dp)
-                        .background(Color(0xFF3A3A3F), RoundedCornerShape(2.dp)))
-                    Spacer(Modifier.height(18.dp))
-                    // Метка — строкой над именем: рядом с именем она съедала
-                    // место, и «Каскад NoV-US_AWG 3.0» обрезался до «Каскад NoV-…».
-                    if (!isAwg) n?.let { nodeLabels.value[it.name] }?.let {
-                        LabelChip(it, 13, Modifier)
-                        Spacer(Modifier.height(6.dp))
-                    }
-                    // Имена серверов бывают длинными («Moscow-Czechia HYSTERIA2»).
-                    // Раньше строка в 30sp без переполнения просто вылезала за
-                    // карточку: флаг срезало слева, текст обрубало справа.
-                    Row(
-                        Modifier.fillMaxWidth().padding(horizontal = 20.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.Center
+                    Column(
+                        Modifier.fillMaxWidth().padding(top = 10.dp, bottom = 26.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        // Не влезает — уменьшаем шрифт, пока не влезет (не мельче
-                        // 14sp, дальше — многоточие). «🇺🇸 Каскад NoV-US_AWG 3.0»
-                        // при крупном системном шрифте Xiaomi резался на «NoV-US_A…».
-                        val startSize = if (title.length > 18) 22 else 30
-                        var fit by remember(title) { mutableIntStateOf(startSize) }
-                        Text(
-                            title, color = Color.White,
-                            fontSize = fit.sp,
-                            fontWeight = FontWeight.Normal, maxLines = 1,
+                        // «грабер»
+                        Box(Modifier.width(34.dp).height(4.dp)
+                            .background(Color(0xFF3A3A3F), RoundedCornerShape(2.dp)))
+                        Spacer(Modifier.height(18.dp))
+                        // Метка — строкой над именем: рядом с именем она съедала
+                        // место, и «Каскад NoV-US_AWG 3.0» обрезался до «Каскад NoV-…».
+                        if (!isAwg) n?.let { nodeLabels.value[it.name] }?.let {
+                            LabelChip(it, 13, Modifier)
+                            Spacer(Modifier.height(6.dp))
+                        }
+                        // Имена серверов бывают длинными («Moscow-Czechia HYSTERIA2»).
+                        // Раньше строка в 30sp без переполнения просто вылезала за
+                        // карточку: флаг срезало слева, текст обрубало справа.
+                        Row(
+                            Modifier.fillMaxWidth().padding(horizontal = 20.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            // Не влезает — уменьшаем шрифт, пока не влезет (не мельче
+                            // 14sp, дальше — многоточие). «🇺🇸 Каскад NoV-US_AWG 3.0»
+                            // при крупном системном шрифте Xiaomi резался на «NoV-US_A…».
+                            val startSize = if (title.length > 18) 22 else 30
+                            var fit by remember(title) { mutableIntStateOf(startSize) }
+                            Text(
+                                title, color = Color.White,
+                                fontSize = fit.sp,
+                                fontWeight = FontWeight.Normal, maxLines = 1,
+                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                onTextLayout = { if (it.hasVisualOverflow && fit > 14) fit -= 1 },
+                                modifier = Modifier.weight(1f, fill = false)
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Icon(Icons.Outlined.KeyboardArrowDown, null, tint = Color.White,
+                                modifier = Modifier.size(22.dp))
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        Text(subtitle, color = ZenGray, fontSize = 15.sp, maxLines = 1,
                             overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                            onTextLayout = { if (it.hasVisualOverflow && fit > 14) fit -= 1 },
-                            modifier = Modifier.weight(1f, fill = false)
-                        )
-                        Spacer(Modifier.width(8.dp))
-                        Icon(Icons.Outlined.KeyboardArrowDown, null, tint = Color.White,
-                            modifier = Modifier.size(22.dp))
+                            modifier = Modifier.padding(horizontal = 20.dp))
                     }
-                    Spacer(Modifier.height(8.dp))
-                    Text(subtitle, color = ZenGray, fontSize = 15.sp, maxLines = 1,
-                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                        modifier = Modifier.padding(horizontal = 20.dp))
                 }
             }
         }
@@ -3445,6 +3454,13 @@ class MainActivity : ComponentActivity() {
                 val center = Offset(size.width / 2f, size.height / 2f)
                 val w = 3.dp.toPx()                       // тонкое кольцо, как у Amnezia
                 val r = size.minDimension / 2f - 12.dp.toPx()
+                // ВЫЛЕТ 06.11 (4 раза, Xiaomi): «ending radius must be > 0».
+                // Холст кольца сжимается, когда экрану тесно — клавиатура в
+                // окне метки или надписи поверх главной, окно поменьше, — и
+                // при высоте меньше 24dp радиус уходил в ноль и минус, а
+                // RadialGradient с таким радиусом роняет всё приложение.
+                // Нечего рисовать — не рисуем.
+                if (r <= 1f) return@Canvas
 
                 // Тонкий плотный ореол вплотную к кольцу (как у Amnezia),
                 // а не широкое размытое пятно.
@@ -3642,7 +3658,10 @@ class MainActivity : ComponentActivity() {
                             color = if (i == selected.intValue) ZenRed.copy(alpha = 0.25f) else ZenCard,
                             shape = RoundedCornerShape(6.dp),
                             modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp).clickable {
-                                selected.intValue = i; prefs.selectedServer = i
+                                // Как в шторке выбора: при живом туннеле —
+                                // сразу на эту ноду, иначе экран показал бы
+                                // одну ноду, а туннель шёл бы через другую.
+                                switchServer(i)
                             }) {
                             Text(n.display(), color = Color.White, fontSize = 13.sp,
                                 modifier = Modifier.padding(10.dp))
@@ -4509,46 +4528,25 @@ class MainActivity : ComponentActivity() {
     private val coreOffer = mutableStateOf("")
 
     // Версия ВСТРОЕННОГО Xray — спрашиваем сам бинарник из APK.
-    private fun builtinXrayVersion(): String = try {
-        val bin = java.io.File(applicationInfo.nativeLibraryDir, "libxrayexec.so")
-        val out = ProcessBuilder(bin.absolutePath, "version").redirectErrorStream(true)
-            .start().inputStream.bufferedReader().readText()
-        Regex("Xray ([0-9.]+)").find(out)?.groupValues?.get(1) ?: "?"
-    } catch (_: Throwable) { "?" }
+    private fun builtinXrayVersion(): String = com.zen.blaster.core.CoreAuto.builtinXray(this)
 
-    // Что из каталога новее стоящего сейчас (модуля или встроенного) — по
-    // одному, самому свежему, на каждое ядро.
     private fun coreOffers(cat: com.zen.blaster.core.CoreModules.Catalog,
-                           builtinXray: String): List<com.zen.blaster.core.CoreModules.Module> {
-        val cm = com.zen.blaster.core.CoreModules
-        val now = mapOf(
-            cm.XRAY to (cm.active(this, cm.XRAY)?.version ?: builtinXray),
-            cm.AWG to (cm.active(this, cm.AWG)?.version ?: com.zen.blaster.core.AmneziaCore.BUILD),
-            cm.AWG_LEGACY to (cm.active(this, cm.AWG_LEGACY)?.version ?: com.zen.blaster.core.AmneziaCore.BUILD_LEGACY))
-        return cat.modules.filter { m -> cm.newer(m.version, now[m.slot] ?: "") }
-            .groupBy { it.slot }
-            .mapNotNull { (_, l) -> l.maxWithOrNull { a, b -> if (cm.newer(a.version, b.version)) 1 else -1 } }
-    }
+                           builtinXray: String) = com.zen.blaster.core.CoreAuto.offers(this, cat, builtinXray)
 
     private fun offerText(l: List<com.zen.blaster.core.CoreModules.Module>) =
-        l.joinToString(", ") { m ->
-            when (m.slot) {
-                com.zen.blaster.core.CoreModules.XRAY -> "Xray"
-                com.zen.blaster.core.CoreModules.AWG -> "Amnezia"
-                else -> "Amnezia 1.x"
-            } + " " + m.version
-        }
+        com.zen.blaster.core.CoreAuto.offerText(l)
 
+    // Ядра — сами, как облачное обновление (см. CoreAuto): проверить сервер
+    // не чаще раза в три часа и поставить, что можно; на экране остаётся
+    // только то, что ждёт Wi-Fi или было снято.
     private fun checkCoresQuietly() {
         coreOffer.value = prefs.coreOffer
-        if (System.currentTimeMillis() - prefs.lastCoreCheck < 3 * 3600_000L) return
         lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
-            val cat = com.zen.blaster.core.CoreModules.fetch(this@MainActivity) ?: return@launch
-            prefs.lastCoreCheck = System.currentTimeMillis()
-            val text = offerText(coreOffers(cat, builtinXrayVersion()))
-            prefs.coreOffer = text
-            runOnUiThread { coreOffer.value = text }
-            if (text.isNotEmpty()) com.zen.blaster.core.Blackbox.note("🧩 доступно обновление ядер: $text")
+            val left = com.zen.blaster.core.CoreAuto.run(this@MainActivity) { m -> runOnUiThread { log(m) } }
+                ?: return@launch
+            runOnUiThread { coreOffer.value = prefs.coreOffer }
+            if (left.isNotEmpty()) com.zen.blaster.core.Blackbox.note(
+                "🧩 доступно обновление ядер: ${offerText(left)}")
         }
     }
 
@@ -4731,7 +4729,7 @@ class MainActivity : ComponentActivity() {
         val best = nodes.withIndex()
             .filter { it.value.ping in 1..899 && it.value.supported() }
             .minByOrNull { it.value.ping }
-        if (best != null) { selected.intValue = best.index; prefs.selectedServer = best.index
+        if (best != null) { switchServer(best.index)
             log("🚀 Авто-выбор: ${best.value.name} (${best.value.ping} ms)") }
         else log("⚠️ Нет живых нод")
     }

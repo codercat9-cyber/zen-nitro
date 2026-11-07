@@ -106,6 +106,9 @@ data class Node(
                     else -> "Reality"
                 }
                 tr.isNotEmpty() -> "VLESS-$tr"
+                // Без TLS — так и пишем: «VLESS-TLS» у ноды security=none
+                // обещал шифрование, которого на этом слое нет.
+                security == "none" -> "VLESS"
                 else -> "VLESS-TLS"
             }
         }

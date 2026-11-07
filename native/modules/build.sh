@@ -75,33 +75,27 @@ for A in $ABIS; do
 done
 
 # ---------------------------------------------------------------- манифест
-MIN_APP_XRAY=$MIN_APP_XRAY python3 - "$OUT" "$XV" "$AWG_TAG" "$LEG_TAG" "$API_XRAY" "$API_AWG" "$MIN_APP" <<'PY'
-import hashlib, json, os, sys, datetime
-out, xv, awg, leg, api_x, api_a, min_app = sys.argv[1:8]
-mods = []
-for f in sorted(os.listdir(out)):
-    p = os.path.join(out, f)
-    if f.startswith("xray-"):
-        core, variant, ver, api = "xray", "main", xv, int(api_x)
-        abi = f[len(f"xray-{xv}-"):]
-    elif f.startswith("awg1-"):
-        core, variant, ver, api = "awg", "legacy", leg, int(api_a)
-        abi = f[len(f"awg1-{leg}-"):-3]
-    elif f.startswith("awg-"):
-        core, variant, ver, api = "awg", "main", awg, int(api_a)
-        abi = f[len(f"awg-{awg}-"):-3]
-    else:
-        continue
-    h = hashlib.sha256(open(p, "rb").read()).hexdigest()
-    mods.append(dict(core=core, variant=variant, version=ver, api=api, abi=abi, file=f,
-                     size=os.path.getsize(p), sha256=h,
-                     minApp=int(os.environ.get("MIN_APP_XRAY", min_app)) if core == "xray" else int(min_app),
-                     notes=""))
-m = dict(schema=1, issued=datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-         modules=mods)
-open(os.path.join(out, "cores.json"), "w").write(json.dumps(m, ensure_ascii=False, indent=1) + "\n")
-print(f"манифест: {len(mods)} модулей")
-PY
+# bash + jq, без Python: по имени файла — ядро, вариант, версия и ABI; к ним
+# размер и sha256. Порядок — по имени файла (LC_ALL=C), как и раньше.
+MODS=()
+while IFS= read -r f; do
+  case "$f" in
+    xray-*) core=xray; variant=main;   ver=$XV;      api=$API_XRAY; abi=${f#"xray-$XV-"} ;;
+    awg1-*) core=awg;  variant=legacy; ver=$LEG_TAG; api=$API_AWG;  abi=${f#"awg1-$LEG_TAG-"}; abi=${abi%.so} ;;
+    awg-*)  core=awg;  variant=main;   ver=$AWG_TAG; api=$API_AWG;  abi=${f#"awg-$AWG_TAG-"}; abi=${abi%.so} ;;
+    *) continue ;;
+  esac
+  ma=$MIN_APP; [ "$core" = xray ] && ma=${MIN_APP_XRAY:-$MIN_APP}
+  MODS+=("$(jq -cn --arg core "$core" --arg variant "$variant" --arg version "$ver" \
+    --argjson api "$api" --arg abi "$abi" --arg file "$f" \
+    --argjson size "$(stat -c%s "$OUT/$f")" --arg sha256 "$(sha256sum "$OUT/$f" | cut -d' ' -f1)" \
+    --argjson minApp "$ma" \
+    '{core:$core, variant:$variant, version:$version, api:$api, abi:$abi, file:$file,
+      size:$size, sha256:$sha256, minApp:$minApp, notes:""}')")
+done < <(ls -1 "$OUT" | LC_ALL=C sort)
+printf '%s\n' "${MODS[@]}" | jq -s --indent 1 --arg issued "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  '{schema:1, issued:$issued, modules:.}' > "$OUT/cores.json"
+echo "манифест: ${#MODS[@]} модулей"
 
 openssl dgst -sha256 -sign "$KEY" "$OUT/cores.json" | base64 -w0 > "$OUT/cores.json.sig"
 # Самопроверка подписи открытым ключом из того же ключа.

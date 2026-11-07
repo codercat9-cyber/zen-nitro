@@ -8,6 +8,7 @@ import android.service.quicksettings.TileService
 import androidx.core.content.ContextCompat
 import com.zen.blaster.MainActivity
 import com.zen.blaster.core.Prefs
+import com.zen.blaster.core.Stats
 
 // ============================================================================
 //  Плитка в шторке: включить/выключить туннель, не открывая приложение.
@@ -89,8 +90,10 @@ class ZenTileService : TileService() {
     // Состояние берём не только из статики: процесс приложения система может
     // прибить, и тогда ZenVpnService.running врёт «выключено», хотя туннель
     // системе известен. Поэтому дополнительно спрашиваем саму систему.
+    // «Включено» — пока служба на переднем плане: и во время переподключения,
+    // когда ядро на секунды погашено, плитка не должна мигать «выключен».
     private fun isOn(prefs: Prefs) =
-        ZenVpnService.running || prefs.awgRunning || ownVpnUp()
+        ZenVpnService.active || ZenVpnService.running || prefs.awgRunning || ownVpnUp()
 
     // Поднят ли ИМЕННО НАШ туннель.
     //
@@ -122,11 +125,14 @@ class ZenTileService : TileService() {
     private fun sync() {
         val prefs = Prefs(this)
         val on = isOn(prefs)
+        // Шторка телефона показывает то же, что подключено: имя ноды и что с
+        // ней сейчас («Подключено», «Переподключаюсь…», «Нет сети — жду»).
+        val node = ZenVpnService.shadeNode.ifEmpty { Stats.server.value }.ifEmpty { prefs.lastServerName }
         qsTile?.apply {
             state = if (on) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
-            label = "ZEN NITRO"
+            label = if (on && node.isNotEmpty()) node.take(32) else "ZEN NITRO"
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
-                subtitle = if (on) "включён" else "выключен"
+                subtitle = if (on) ZenVpnService.shadeState.ifEmpty { "включён" } else "выключен"
             updateTile()
         }
     }

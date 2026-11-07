@@ -3,18 +3,16 @@
 #  Робот модулей ядер на машине сборки (то же, что .github/workflows/cores.yml,
 #  только выкладывает прямо на наш сервер).
 #
-#    tools/cores-bot.sh            — проверить апстрим; вышло новое — собрать,
-#                                    прогнать конфиги и ПОЗВАТЬ на проверку
-#                                    (уведомление на рабочем столе). Людям
-#                                    НЕ выкладывает.
-#    tools/cores-bot.sh --publish  — после проверки на телефоне: собрать
-#                                    (если ещё нет), подписать и выложить. У
-#                                    людей в Zen появится «Доступно обновление
-#                                    ядер».
+#    tools/cores-bot.sh            — проверить апстрим; вышло новое — собрать
+#                                    и прогнать проверки. Людям не выкладывает.
+#    tools/cores-bot.sh --publish  — то же и, если всё зелёное, выложить на
+#                                    сервер обновлений: Zen у людей поставит
+#                                    ядра сам (core/CoreAuto.kt).
 #    tools/cores-bot.sh --force    — то же, даже если версии не новее
 #
-#  Почему не выкладывает сам (решение 31.10.2026): новое ядро уходит живым
-#  людям, а прогон конфигов на ПК не заменяет проверки на телефоне.
+#  Управляет им программа tools/zen-cores.sh (ярлык «Zen Ядра»): ночью — с
+#  --publish, если в ней включено «выкладывать сам» (решение 06.11.2026:
+#  ядра доходят до людей через сервер, как облачное обновление).
 #
 #  sing-box модулем не обновляется: он внутри APK (libbox.aar). Робот только
 #  замечает его новый выпуск, пишет в журнал и шлёт уведомление на рабочий
@@ -37,7 +35,8 @@ SM="${SM:-$HOME/Рабочий стол/STORAGE&MESSAGER/PROJECT/PROJECT STORAGE
 WORK="${WORK:-$HOME/build/zen-modules}"
 LOG="${LOG:-$WORK/cores-bot.log}"
 mkdir -p "$WORK"
-exec > >(tee -a "$LOG") 2>&1
+# Из программы tools/zen-cores.sh журнал ведёт она сама — без двойных строк.
+[ -n "${ZEN_CORES_PROGRAM:-}" ] || exec > >(tee -a "$LOG") 2>&1
 echo "=== $(date '+%F %T') робот модулей ядер"
 export GOTOOLCHAIN="${GOTOOLCHAIN:-go1.27.2}"
 export JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-17-openjdk-amd64}"
@@ -48,7 +47,7 @@ AWG=$(tag https://github.com/amnezia-vpn/amneziawg-go '^v3\.[0-9]+\.[0-9]+$')
 [ -n "$XR" ] && [ -n "$AWG" ] || { echo "апстрим не ответил"; exit 1; }
 
 HAVE=$(curl --noproxy '*' -fs -A "ZenNitro/bot" http://localhost:8080/updates/zen/cores/cores.json \
-  | python3 -c 'import json,sys; m=json.load(sys.stdin)["modules"]; print(" ".join(sorted({x["core"]+":"+x["version"] for x in m})))' \
+  | jq -r '[.modules[] | .core + ":" + .version] | unique | join(" ")' \
   2>/dev/null || true)
 echo "апстрим: xray ${XR#v}, awg $AWG · у нас: ${HAVE:-ничего}"
 # sing-box: следим за выпуском, но собрать модулем не можем — см. шапку.
@@ -107,9 +106,9 @@ else
 fi
 if [ -z "$PUBLISH" ]; then
   echo "🧩 собраны и проверены: xray ${XR#v}, awg $AWG — $ZEN/build/modules"
-  echo "   НЕ выложены: проверить на телефоне, потом tools/cores-bot.sh --publish"
+  echo "   НЕ выложены: выложить — в «Zen Ядра» (tools/zen-cores.sh) или cores-bot.sh --publish"
   notify-send "ZEN NITRO: новые ядра собраны" \
-    "Xray ${XR#v}, AmneziaWG $AWG — проверь на телефоне, потом cores-bot.sh --publish" 2>/dev/null || true
+    "Xray ${XR#v}, AmneziaWG $AWG — выложить людям: «Zen Ядра» → «Выложить»" 2>/dev/null || true
   exit 0
 fi
 "$SM/tools/publish-cores.sh"

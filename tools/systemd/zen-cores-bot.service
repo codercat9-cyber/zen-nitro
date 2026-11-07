@@ -1,9 +1,9 @@
 [Unit]
-Description=ZEN NITRO: робот модулей ядер (свежие Xray/AmneziaWG → сборка → проверка → выкладка)
+Description=ZEN NITRO: ядра — апстрим → сборка → проверки → выкладка людям (tools/zen-cores.sh auto)
 After=network-online.target
 
 [Service]
 Type=oneshot
 # Путь к проекту — поправить, если переехал.
-ExecStart=%h/Рабочий\x20стол/ZenNitro/zen-nitro/tools/cores-bot.sh
+ExecStart=%h/Рабочий\x20стол/ZenNitro/zen-nitro/tools/zen-cores.sh auto
 Nice=15

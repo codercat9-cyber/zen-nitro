@@ -276,6 +276,9 @@ object CoreModules {
     fun revert(ctx: Context, slot: String, why: String) {
         val st = readState(ctx)
         if (!st.has(slot)) return
+        // Снятую версию запоминаем: сами (CoreAuto) её больше не поставим.
+        st.optJSONObject(slot)?.optString("version")?.takeIf { it.isNotEmpty() }
+            ?.let { Prefs(ctx).setRejectedCore(slot, it) }
         st.remove(slot)
         writeState(ctx, st)
         File(root(ctx), slot).deleteRecursively()

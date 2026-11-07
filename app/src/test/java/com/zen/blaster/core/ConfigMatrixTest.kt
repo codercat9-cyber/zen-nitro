@@ -143,6 +143,10 @@ class ConfigMatrixTest {
             Node("VLESS", "reality-finalmask", "203.0.113.26", 443, uuid = uuid, sni = "www.microsoft.com",
                 pbk = pbk, sid = "ab12", security = "reality", flow = "xtls-rprx-vision",
                 fm = """{"tcp":[{"type":"fragment","settings":{"packets":"tlshello","lengths":["3-5","6-8"],"delays":["10-20"]}}]}"""),
+            // Hysteria2 через Xray (второе ядро): Salamander, прыжки по портам
+            // и шум «как у Amnezia» с приманкой I1 из AWG-профиля.
+            Node("Hysteria2", "hy2-xray", "203.0.113.27", 443, auth = "secret", sni = "hy.example.com",
+                obfs = "salamander", obfsPw = "obfspw", hopPorts = "20000-30000,443", alpn = "h3"),
         )
         for (n in x) {
             for ((mode, cfg) in mapOf(
@@ -150,6 +154,8 @@ class ConfigMatrixTest {
                 "armor" to XrayEngine.buildConfig(n, armor = true, fp = "chrome"),
                 "front" to XrayEngine.buildConfig(n, armor = true, fp = "chrome", frontDomain = "vk.com"),
                 "dpi" to XrayEngine.buildConfig(n, armor = true, fp = "chrome", viaDpi = true),
+                "bait" to XrayEngine.buildConfig(n, armor = true, fp = "chrome",
+                    bait = listOf("<b 0xc70000000108ce1bc3a4><c><t><r 50>")),
             )) File(dir, "${n.name}--$mode.json").writeText(cfg.toString(2))
         }
     }

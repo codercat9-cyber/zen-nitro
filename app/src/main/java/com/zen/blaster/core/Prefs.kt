@@ -46,6 +46,13 @@ class Prefs(context: Context) {
         get() = sp.getString("selKey", "") ?: ""
         set(v) = sp.edit().putString("selKey", v).apply()
 
+    // Какая нода СЕЙЧАС в туннеле («адрес:порт|имя»). Пишут подключение и
+    // переход сторожа, стирает отключение. Пока туннель жив, экран выбора
+    // держится за неё, а не за selectedKey (см. MainActivity.restoreSelection).
+    var connectedKey: String
+        get() = sp.getString("connKey", "") ?: ""
+        set(v) = sp.edit().putString("connKey", v).apply()
+
     // Пускать РУ-сайты мимо туннеля. Удобно (банки, госуслуги), но такие сайты
     // видят настоящий IP и страну — поэтому по умолчанию ВЫКЛЮЧЕНО.
     var geoRouting: Boolean
@@ -414,6 +421,13 @@ class Prefs(context: Context) {
     // приложения снова запускало бы веер по двум сотням серверов.
     // Тихая проверка модулей ядер: когда была и что нашла («Xray 26.10.29»).
     // Найденное держим и между запусками — по нему горит надпись на главной.
+    // Версия модуля ядра, которую снимали (автооткат или «ВЕРНУТЬ ВСТРОЕННОЕ»):
+    // сами её больше не ставим, только предлагаем. См. CoreAuto.
+    fun rejectedCore(slot: String): String = sp.getString("rejectedCore_$slot", "") ?: ""
+    fun setRejectedCore(slot: String, version: String) {
+        sp.edit().putString("rejectedCore_$slot", version).apply()
+    }
+
     var lastCoreCheck: Long
         get() = sp.getLong("lastCoreCheck", 0L)
         set(v) = sp.edit().putLong("lastCoreCheck", v).apply()

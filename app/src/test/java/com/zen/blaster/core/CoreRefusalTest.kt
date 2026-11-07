@@ -29,6 +29,16 @@ class CoreRefusalTest {
             "outbound/direct[direct]: dial tcp 1.2.3.4:443: connect: connection refused"))
     }
 
+    // Эмулятор, 06.11.2026: та же беда через Xray — у него свой формат строки.
+    @Test fun resetToNodeViaXray() {
+        assertTrue(CoreRefusal.refusedTo("[Xray] 2026/11/06 19:30:12 [Info] app/proxyman/outbound: failed to " +
+            "process outbound traffic > proxy/vless/outbound: failed to find an available destination > " +
+            "common/retry: [dial tcp 10.0.2.2:20001: connect: connection refused]") == "10.0.2.2:20001")
+        // Прямой выход Xray (freedom) — не про ноду.
+        assertNull(CoreRefusal.refusedTo("[Xray] proxy/freedom: failed to open connection > " +
+            "dial tcp 1.2.3.4:443: connect: connection refused"))
+    }
+
     @Test fun ordinaryTimeoutIsNotRefusal() {
         assertNull(CoreRefusal.parse("connection: open connection to 1.2.3.4:443 using " +
             "outbound/hysteria2[proxy]: context deadline exceeded"))
