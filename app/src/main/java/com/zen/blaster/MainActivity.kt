@@ -288,6 +288,16 @@ class MainActivity : ComponentActivity() {
     // адреса при каждом обновлении подписки. Выбор человека при этом слетал
     // на первую ноду списка, а в журнал шло «прежний сервер пропал» — хотя
     // сервер никуда не девался. Отсюда и жалоба, что серверы сами сбиваются.
+    // Метки переименованных провайдером нод — на новые имена (см. Prefs).
+    private fun relabel() {
+        val moved = prefs.migrateNodeLabels(nodes)
+        moved.forEach { (old, new) ->
+            log("🏷 метка переехала: «$old» → «$new» (тот же адрес)")
+            com.zen.blaster.core.Blackbox.note("🏷 метка переехала: «$old» → «$new» (тот же адрес)")
+        }
+        nodeLabels.value = prefs.nodeLabels()
+    }
+
     private fun restoreSelection() {
         // ПОКА ТУННЕЛЬ ЖИВ — ЭКРАН ПОКАЗЫВАЕТ ТУ НОДУ, ЧЕРЕЗ КОТОРУЮ ОН ИДЁТ.
         //
@@ -502,6 +512,7 @@ class MainActivity : ComponentActivity() {
         val dismissed = prefs.dismissedNodes()
         nodes.addAll(prefs.cachedNodes().filterNot { dismissKey(it) in dismissed })
         restoreSelection()
+        relabel()
         checkCoresQuietly()
 
         setContent { ZenTheme { HomeScreen() } }
@@ -1057,6 +1068,7 @@ class MainActivity : ComponentActivity() {
             // пересобрался, и номер почти наверняка указывает на другую.
             if (prefs.selectedKey.isEmpty()) keep?.let { prefs.selectedKey = keyOf(it) }
             restoreSelection()
+            relabel()
             pingTick.intValue++
             log("Загружено серверов: ${nodes.size}")
             // Разбивка по протоколам. Без неё пропажу целого протокола не
@@ -1606,13 +1618,20 @@ class MainActivity : ComponentActivity() {
             lanProxy = prefs.lanProxy, lanUser = prefs.lanUser, lanPass = prefs.lanPass,
             dohUrl = prefs.dnsUrl(), directDohUrl = prefs.preDnsUrl(), chainViaDpi = chainOn
         ).toString()
-        if (n?.type == "Hysteria2") {
+        // Hysteria2 через Xray: заявленных скоростей Xray не берёт (у него свой
+        // контроль перегрузки), отпечатка TLS у QUIC нет — и в журнале этого
+        // не пишем. Было «Brutal 6↓ / 1↑» и «отпечаток chrome, padding, xudp»
+        // при подъёме через Xray — неправда (07.11, Bypass-hy2-AT).
+        val hyViaXray = n?.type == "Hysteria2" && viaXray
+        if (n?.type == "Hysteria2" && !hyViaXray) {
             val (bd, bu) = brutal()
             if (bd > 0) log("⚡ Hysteria2 в режиме Brutal: $bd↓ / $bu↑ Мбит/с")
             else log("🌊 Hysteria2 на BBR — канал слишком узкий для заявленного темпа")
         }
-        if (prefs.armor) log("🛡 Броня: отпечаток ${if (viaXray) fp else ConfigBuilder.lastFingerprint}, " +
-            "padding, xudp, IPv6 off" + if (dpiOn) ", фрагментация TLS (ByeDPI)" else "")
+        if (prefs.armor) log(
+            if (hyViaXray) "🛡 Броня: шум перед рукопожатием (как у Amnezia), IPv6 off"
+            else "🛡 Броня: отпечаток ${if (viaXray) fp else ConfigBuilder.lastFingerprint}, " +
+                "padding, xudp, IPv6 off" + if (dpiOn) ", фрагментация TLS (ByeDPI)" else "")
         // В режиме прокси системный VPN не поднимается — согласие не нужно.
         val prep = if (proxyMode) null else VpnService.prepare(this)
         if (prep != null) { pendingConfig = config; vpnPermission.launch(prep) }
@@ -2673,10 +2692,14 @@ class MainActivity : ComponentActivity() {
         val current = nodeLabels.value[name].orEmpty()
         var text by remember(name) { mutableStateOf(current) }
         fun save(v: String?) {
-            prefs.setNodeLabel(name, v)
+            val node = nodes.firstOrNull { it.name == name }
+            prefs.setNodeLabel(name, v, node?.let { traitKey(it) } ?: "")
             nodeLabels.value = prefs.nodeLabels()
             labelFor.value = null
-            log(if (v.isNullOrBlank()) "🏷 «$name»: метка снята" else "🏷 «$name» подписана: ${v.trim()}")
+            val msg = if (v.isNullOrBlank()) "🏷 «$name»: метка снята" else "🏷 «$name» подписана: ${v.trim()}"
+            log(msg)
+            // И в журнал — по нему метки можно восстановить, если что.
+            com.zen.blaster.core.Blackbox.note(msg + (node?.let { " (${traitKey(it)})" } ?: ""))
         }
         AlertDialog(
             onDismissRequest = { labelFor.value = null },

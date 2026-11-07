@@ -261,13 +261,47 @@ class Prefs(context: Context) {
         } catch (_: Throwable) {}
     }
 
-    fun setNodeLabel(name: String, label: String?) {
+    // key — «адрес:порт» ноды. По имени метка живёт, пока провайдер не
+    // переименует ноду; по адресу с портом — переезжает на новое имя.
+    // 07.11: Триллер переименовал «Германия_AWG 3.0» в «Каскад Germany»,
+    // и метки, поставленные накануне, отвалились.
+    fun setNodeLabel(name: String, label: String?, key: String = "") {
         if (name.isBlank()) return
         try {
             val o = JSONObject(sp.getString("nodeLabels", "{}") ?: "{}")
-            if (label.isNullOrBlank()) o.remove(name) else o.put(name, label.trim().take(24))
-            sp.edit().putString("nodeLabels", o.toString()).apply()
+            val k = JSONObject(sp.getString("nodeLabelKeys", "{}") ?: "{}")
+            if (label.isNullOrBlank()) { o.remove(name); k.remove(name) }
+            else { o.put(name, label.trim().take(24)); if (key.isNotEmpty()) k.put(name, key) }
+            sp.edit().putString("nodeLabels", o.toString()).putString("nodeLabelKeys", k.toString()).apply()
         } catch (_: Throwable) {}
+    }
+
+    fun nodeLabelKeys(): Map<String, String> = try {
+        val o = JSONObject(sp.getString("nodeLabelKeys", "{}") ?: "{}")
+        o.keys().asSequence().associateWith { o.optString(it) }.filterValues { it.isNotBlank() }
+    } catch (_: Throwable) { emptyMap() }
+
+    // Метки, чьих имён больше нет в списке, — на ноды с тем же адресом и
+    // портом (если у тех своей метки нет). Возвращает «старое → новое».
+    fun migrateNodeLabels(current: List<com.zen.blaster.model.Node>): List<Pair<String, String>> {
+        val labels = nodeLabels()
+        val keys = nodeLabelKeys()
+        val names = current.map { it.name }.toSet()
+        val moved = mutableListOf<Pair<String, String>>()
+        for ((old, label) in labels) {
+            if (old in names) continue
+            val key = keys[old] ?: continue
+            val n = current.firstOrNull { "${it.addr}:${it.port}" == key && it.name !in labels } ?: continue
+            setNodeLabel(old, null)
+            setNodeLabel(n.name, label, key)
+            moved += old to n.name
+        }
+        // Старым меткам без адреса (поставлены до 3.7.5) — адрес текущей ноды.
+        for ((name, _) in nodeLabels()) {
+            if (name in keys) continue
+            current.firstOrNull { it.name == name }?.let { setNodeLabel(name, nodeLabels()[name], "${it.addr}:${it.port}") }
+        }
+        return moved
     }
 
     // Ссылки на отдельные серверы, добавленные вручную (vless://, hy2://…).
