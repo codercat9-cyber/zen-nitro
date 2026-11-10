@@ -33,6 +33,7 @@ object RadioKick {
     )
     private const val BYTES = 262_143
     private const val MIN_GAP = 3 * 60_000L
+    private val kickHttp by lazy { Bypass.http() }
 
     @Volatile private var lastAt = 0L
 
@@ -55,20 +56,20 @@ object RadioKick {
                 kotlin.concurrent.thread(isDaemon = true) { try { net.getAllByName(h) } catch (_: Throwable) {} }
             var got = 0L
             for (u in URLS) {
+                // Мимо туннеля через protect(): привязка к сети внутри своего
+                // туннеля запрещена (EPERM), и рывок «не проходил» на живой сети.
                 try {
-                    val c = net.openConnection(java.net.URL(u)) as java.net.HttpURLConnection
-                    c.connectTimeout = 4000
-                    c.readTimeout = 4000
-                    c.setRequestProperty("Range", "bytes=0-$BYTES")
-                    if (c.responseCode in 200..299) c.inputStream.use { s ->
-                        val buf = ByteArray(16384)
-                        while (true) {
-                            val n = s.read(buf); if (n < 0) break
-                            got += n
-                            if (System.currentTimeMillis() - t0 > 5000) break
+                    val req = okhttp3.Request.Builder().url(u).header("Range", "bytes=0-$BYTES").build()
+                    kickHttp.newCall(req).execute().use { r ->
+                        if (r.code in 200..299) r.body?.byteStream()?.use { s ->
+                            val buf = ByteArray(16384)
+                            while (true) {
+                                val n = s.read(buf); if (n < 0) break
+                                got += n
+                                if (System.currentTimeMillis() - t0 > 5000) break
+                            }
                         }
                     }
-                    c.disconnect()
                 } catch (_: Throwable) {}
                 if (got > 0) break
             }

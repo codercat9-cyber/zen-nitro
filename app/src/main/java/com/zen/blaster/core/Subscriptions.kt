@@ -206,6 +206,8 @@ object Subscriptions {
                 part = part - fake.toSet()
             }
             report += "$short: HTTP ${res.first}, ${res.second.length} симв. → ${part.size} нод"
+            if (res.second.trimStart().let { it.startsWith("{") || it.startsWith("[") })
+                XrayConfigParser.groups(res.second).take(6).forEach { report += "   ⚖ $it" }
             // ОТВЕТИЛА, НО НИ ОДНОЙ НОДЫ — САМЫЙ ОБИДНЫЙ СЛУЧАЙ.
             //
             // Подписка жива, тело пришло, а разобрать мы его не смогли: панель
@@ -229,7 +231,15 @@ object Subscriptions {
             }
             if (part.isEmpty()) continue
             gotFrom += short
-            for (n in part) merged.getOrPut(mergeKey(n)) { n }
+            // Нода-группа из JSON совпала с обычной ссылкой (первый сервер
+            // группы тот же): побеждает ссылка, но конфиг группы переезжает
+            // к ней — иначе запасные серверы терялись бы при склейке.
+            for (n in part) {
+                val k = mergeKey(n)
+                val had = merged[k]
+                if (had == null) merged[k] = n
+                else if (had.raw.isEmpty() && n.raw.isNotEmpty()) merged[k] = had.copy(raw = n.raw)
+            }
         }
         if (merged.isNotEmpty()) {
             lastAgent = gotFrom.joinToString("+")
@@ -380,12 +390,10 @@ object Subscriptions {
     private fun client(): OkHttpClient {
         val vpn = com.zen.blaster.vpn.ZenVpnService
         if (!vpn.running || vpn.channelProven) return http
-        val net = Resolver.physical() ?: return http
+        Resolver.physical() ?: return http
         return http.newBuilder()
-            .socketFactory(net.socketFactory)
-            .dns(object : okhttp3.Dns {
-                override fun lookup(hostname: String) = net.getAllByName(hostname).toList()
-            })
+            .socketFactory(Bypass.factory)
+            .dns(Bypass.dns)
             .build()
     }
 
@@ -715,7 +723,7 @@ object Subscriptions {
     // пинг врёт дважды: сервер мог быть мёртв, а выглядел самым быстрым.
     // Имя ноды разрешаем шифрованным DNS: ответ оператора бывает заглушкой.
     private fun physSocket(): Socket =
-        Resolver.physical()?.socketFactory?.createSocket() ?: Socket()
+        Bypass.socket()
 
     private fun target(host: String, port: Int): InetSocketAddress {
         val ip = if (Resolver.isIpLiteral(host)) host else Resolver.resolve(host)
@@ -730,6 +738,15 @@ object Subscriptions {
         nodes.map { n ->
             async(Dispatchers.IO) {
                 val ms = gate.withPermit {
+                    // QUIC-нода — честный UDP-пинг на её же порту (вопрос о
+                    // версии QUIC, см. LineProbe.quicPing). Не ответила —
+                    // дальше по-старому, оценкой по соседнему TCP.
+                    if (n.quic()) {
+                        val ip = target(n.addr, n.port).address?.hostAddress
+                        val q = if (ip != null) LineProbe.quicPing(ip, n.port,
+                            if (n.obfs.equals("salamander", true)) n.obfsPw else "", wait) else -1
+                        if (q > 0) { n.pingExact = true; return@withPermit q }
+                    }
                     try {
                         val addr = target(n.addr, n.port)
                         val t = System.currentTimeMillis()
@@ -737,6 +754,15 @@ object Subscriptions {
                         n.pingExact = true
                         (System.currentTimeMillis() - t).toInt()
                     } catch (e: Exception) {
+                        // Группа провайдера жива, пока отвечает хоть один её сервер.
+                        if (n.raw.isNotEmpty()) for ((h, p) in XrayEngine.groupEndpoints(n).drop(1)) {
+                            try {
+                                val t = System.currentTimeMillis()
+                                physSocket().use { it.connect(target(h, p), wait) }
+                                n.pingExact = false
+                                return@withPermit (System.currentTimeMillis() - t).toInt()
+                            } catch (_: Exception) {}
+                        }
                         // QUIC-ноде отказ по TCP ничего не говорит: сервер может
                         // слушать только UDP. Помечаем «не измерено» (-1), а не
                         // «мертва» (999) — иначе рабочие ноды пропадают из списка.

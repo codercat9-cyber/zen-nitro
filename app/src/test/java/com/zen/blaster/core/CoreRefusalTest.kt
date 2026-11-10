@@ -44,3 +44,13 @@ class CoreRefusalTest {
             "outbound/hysteria2[proxy]: context deadline exceeded"))
     }
 }
+
+// Свой локальный порт — не отказ сервера (журнал 09.11 с realme).
+class CoreRefusalLoopbackTest {
+    @Test fun loopbackIsNotServerRefusal() {
+        org.junit.Assert.assertNull(CoreRefusal.refusedTo("ERROR[0001] connection: open connection to 1.2.3.4:443 " +
+            "using outbound/socks[proxy]: dial tcp 127.0.0.1:38614: connect: connection refused"))
+        org.junit.Assert.assertEquals("91.243.86.67:456", CoreRefusal.refusedTo("ERROR[0000] connection: open connection to " +
+            "149.154.167.51:443 using outbound/vless[proxy]: dial ccmni0 (14): dial tcp 91.243.86.67:456: connect: connection refused"))
+    }
+}

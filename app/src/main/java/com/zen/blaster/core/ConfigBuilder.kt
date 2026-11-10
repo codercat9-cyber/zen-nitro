@@ -49,13 +49,28 @@ object ConfigBuilder {
     // человека. А safari бывает только на iPhone: на Android он выдаёт сам
     // себя. Поэтому отпечаток выбирается один раз (чаще всего chrome — самый
     // массовый на Android) и дальше не меняется.
-    private val WEIGHTED = listOf("chrome", "chrome", "chrome", "chrome", "chrome",
-        "chrome", "chrome", "firefox", "firefox", "edge")
+    //
+    // 10.11.2026 — ВСЕМ «edge». Замер на Xray 26.10.10 (Reality, своё
+    // приветствие на локальный приёмник): chrome — 1818 байт, firefox —
+    // 1887, safari — 1535 (все с постквантовым ключом X25519MLKEM768 и не
+    // влезают в один TCP-пакет), edge и ios — 517 байт без ключа. В тот же
+    // день у всех встали VLESS/Reality: линия чистая, наше проверочное
+    // приветствие на 228 байт получает ServerHello за 40–80 мс, а Xray с
+    // chrome из 25–48 дозвонов открывал 3. «android» Reality не годится
+    // вовсе — с ним Xray до сервера не доходит. Отпечаток по-прежнему один на
+    // устройство; просто теперь это edge (Edge на Android — обычное дело).
+    private val WEIGHTED = listOf("edge")
     fun freshFingerprint(): String = WEIGHTED.random()
+
+    // Отпечатки с постквантовым ключом: приветствие больше пакета.
+    val HEAVY_FP = setOf("chrome", "firefox", "safari", "random", "randomized", "")
 
     // Отпечаток этого устройства. Ставит приложение/служба из Prefs при старте.
     @Volatile var deviceFp: String = ""
-    fun pickFingerprint(): String = deviceFp.ifEmpty { "chrome" }
+    // Тонкая настройка из Prefs.applyTuning(): отказ QUIC на TCP-нодах и стек TUN.
+    @Volatile var blockQuic: Boolean = true
+    @Volatile var tunStack: String = "auto"
+    fun pickFingerprint(): String = deviceFp.ifEmpty { "edge" }
 
     // Последний использованный отпечаток — показываем в UI/логе.
     @Volatile var lastFingerprint: String = ""; private set
@@ -169,6 +184,19 @@ object ConfigBuilder {
             if (have.contains("geosite-ads"))
                 rules.put(JSONObject().put("rule_set", JSONArray().put("geosite-ads")).put("action", "reject"))
         }
+
+        // QUIC — ОТКАЗ СРАЗУ, ЕСЛИ НОДА НА TCP.
+        //
+        // 10.11.2026, Tele2, XHTTP «AI🤖», разбор соединений: «udp
+        // 142.250.130.138:443 · ↑44,3 КБ ↓0 Б» 63 секунды. YouTube и всё от
+        // Google сначала стучатся по QUIC (UDP/443); через VLESS поверх TCP
+        // ответа нет, и приложение ждёт, вместо того чтобы уйти на обычный
+        // HTTPS. Отсюда «через VLESS и Reality не грузит, выручает только
+        // Hysteria» — у неё сам транспорт QUIC. Отказ (ICMP «недоступно») — и
+        // приложение без паузы идёт по TCP. Так же делают Happ и v2rayNG
+        // («блокировать QUIC»). Российское напрямую — выше, его не трогает.
+        if (blockQuic && useVpn && n != null && !n.quic())
+            rules.put(JSONObject().put("network", "udp").put("port", 443).put("action", "reject"))
 
         val route = JSONObject()
             .put("rules", rules)
@@ -288,6 +316,27 @@ object ConfigBuilder {
             exclude.forEach { arr.put(it) }
             tun.put("exclude_package", arr)
         }
+        // СТЕК gvisor, КОГДА НАС САМИХ НЕТ В ТУННЕЛЕ.
+        //
+        // Стек «system» принимает TCP приложений сокетом НАШЕГО процесса на
+        // адресе туннеля, и ответы этого сокета маршрутизируются по правилам
+        // нашего UID. Вывели себя из туннеля (Xray, ByeDPI) — ответы уходят
+        // мимо tun, и рукопожатие TCP не собирается: DNS (перехват пакетов)
+        // работает, «канал живой» (замер идёт из самого ядра), а приложения
+        // по TCP не соединяются вовсе. 10.11.2026, Xiaomi, Tele2, Reality
+        // Пантеры и XHTTP Sirius через Xray: curl 2 МБ — 0 байт за 25 с,
+        // time_connect 0, в sing-box ни одного входящего TCP; через Hysteria
+        // (своё ядро, мы в туннеле) — 690 КБ/с. С 3.7.7 через Xray пошли все
+        // VLESS — отсюда «сегодня умерли все VLESS и Reality». gvisor держит
+        // TCP внутри sing-box, наш UID в этом не участвует (у INCY так же:
+        // TCP собирает HEV в пространстве пользователя).
+        when (tunStack) {
+            // system и mixed принимают TCP нашим сокетом — когда мы вне туннеля
+            // (Xray, ByeDPI), так TCP не идёт вовсе (см. выше). Там — всегда gvisor.
+            "gvisor" -> tun.put("stack", "gvisor")
+            "system", "mixed" -> tun.put("stack", if (SELF_PKG in exclude) "gvisor" else tunStack)
+            else -> if (SELF_PKG in exclude) tun.put("stack", "gvisor")
+        }
 
         // ---- входы ----
         //
@@ -396,6 +445,12 @@ object ConfigBuilder {
                               hyDown: Int = 0, hyUp: Int = 0,
                               slowLink: Boolean = false): JSONObject {
         val out = JSONObject().put("tag", "proxy").put("server", n.addr).put("server_port", n.port)
+        // KEEPALIVE ДО СЕРВЕРА: 30 с простоя, дальше каждые 15 с. У sing-box
+        // по умолчанию 5 минут — а NAT оператора забывает простаивающее
+        // TCP-соединение раньше, и оно умирает молча: мессенджер не получает
+        // пуш, замер «молчит», туннель рвут. Так держат клиенты вроде INCY.
+        if (n.type != "Hysteria2" && n.type != "TUIC")
+            out.put("tcp_keep_alive", "30s").put("tcp_keep_alive_interval", "15s")
         // Цепочка через DPI — только для TCP-протоколов (Hy2/TUIC — QUIC/UDP, им TCP-SOCKS ломает связь).
         // Аварийные ноды через ByeDPI не пускаем НИКОГДА: он корёжит приветствие,
         // которое мы как раз делаем похожим на обычный поход на сайт.
@@ -424,7 +479,9 @@ object ConfigBuilder {
                 if (n.security != "none") {
                     // Под бронёй отпечаток случайный (меняется каждую сессию),
                     // иначе — из подписки или chrome по умолчанию.
-                    val useFp = if (armor && fp.isNotEmpty()) fp else n.fp.ifEmpty { "chrome" }
+                    val useFp = (if (armor && fp.isNotEmpty()) fp else n.fp.ifEmpty { "edge" })
+                        // «android» (OkHttp, Android 11) не умеет TLS 1.3 — Reality с ним не встанет.
+                        .let { if (n.pbk.isNotEmpty() && it == "android") "edge" else it }
                     val front = frontable(n, frontDomain)
                     val sni = if (front) frontDomain
                               else n.sni.ifEmpty { if (n.host.isNotEmpty()) n.host else n.addr }
@@ -538,7 +595,7 @@ object ConfigBuilder {
                 out.put("type", "trojan").put("password", n.password)
                 out.put("tls", JSONObject().put("enabled", true)
                     .put("server_name", n.sni.ifEmpty { n.addr })
-                    .put("utls", JSONObject().put("enabled", true).put("fingerprint", "chrome")))
+                    .put("utls", JSONObject().put("enabled", true).put("fingerprint", pickFingerprint())))
             }
             "Shadowsocks" -> out.put("type", "shadowsocks").put("method", n.method).put("password", n.password)
         }

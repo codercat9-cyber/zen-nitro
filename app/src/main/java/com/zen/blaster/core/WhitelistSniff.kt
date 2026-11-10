@@ -72,9 +72,9 @@ object WhitelistSniff {
     // опрос раз за разом выдавал «сети нет вовсе»: он стучался в собственный
     // упавший туннель. Имя разрешаем тоже через сеть оператора.
     private fun reach(host: String, port: Int, timeoutMs: Int = 3500): Boolean = try {
-        val net = Resolver.physical()
-        val addr = if (net != null) net.getAllByName(host).first() else java.net.InetAddress.getByName(host)
-        val sock = net?.socketFactory?.createSocket() ?: Socket()
+        val addr = Resolver.physical()?.let { n -> try { n.getAllByName(host).first() } catch (_: Exception) { null } }
+            ?: Bypass.dns.lookup(host).first()
+        val sock = Bypass.socket()
         sock.use { s ->
             s.connect(InetSocketAddress(addr, port), timeoutMs)
             true

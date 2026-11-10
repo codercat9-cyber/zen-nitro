@@ -67,6 +67,76 @@ class Prefs(context: Context) {
         get() = sp.getBoolean("autoRe", true)
         set(v) = sp.edit().putBoolean("autoRe", v).apply()
 
+    // САМ НА ДРУГУЮ НОДУ — только если человек так решил. 09.11: Zen ушёл с
+    // «Каскад USA» на Обход-6 и Обход-3 и час их крутил; INCY рядом держал
+    // ровно ту ноду, что выбрали. «Куда просили» — по умолчанию.
+    var autoSwitchNode: Boolean
+        get() = sp.getBoolean("autoSwitchNode", false)
+        set(v) = sp.edit().putBoolean("autoSwitchNode", v).apply()
+
+    // ------------------------------------- тонкая настройка соединения (10.11.2026)
+    //
+    // Умолчания — по замерам на Xiaomi (Tele2) и по INCY/Karing:
+    //  - mux выкл.: восемь потоков в одном TCP — придушат одно соединение,
+    //    встанет всё (у INCY — «как задал провайдер», у Karing — выкл.);
+    //  - нарезка приветствия вкл. (100–200 Б, 10–20 мс — как у Happ/INCY);
+    //  - QUIC на TCP-нодах — отказ сразу: YouTube и Google не висят на UDP;
+    //  - стек TUN «авто»: gvisor, когда мы сами вне туннеля (Xray, ByeDPI),
+    //    иначе system;
+    //  - отпечаток «лёгкий»: Chrome 120 (517–596 Б) вместо chrome с
+    //    постквантовым ключом (1,8 КБ).
+    var muxOn: Boolean
+        get() = sp.getBoolean("muxOn", false)
+        set(v) = sp.edit().putBoolean("muxOn", v).apply()
+    var fragOn: Boolean
+        get() = sp.getBoolean("fragOn", true)
+        set(v) = sp.edit().putBoolean("fragOn", v).apply()
+    var blockQuic: Boolean
+        get() = sp.getBoolean("blockQuic", true)
+        set(v) = sp.edit().putBoolean("blockQuic", v).apply()
+    var tunStack: String                       // auto | system | gvisor | mixed
+        get() = sp.getString("tunStack", "auto") ?: "auto"
+        set(v) = sp.edit().putString("tunStack", v).apply()
+    var tlsFpChoice: String                    // light | ios | chrome | firefox
+        get() = sp.getString("tlsFpChoice", "light") ?: "light"
+        set(v) = sp.edit().putString("tlsFpChoice", v).putString("tlsFp", fpForBox(v))
+            .putBoolean("tlsFpLight", true).apply()
+
+    private fun fpForBox(choice: String) = when (choice) {
+        "ios" -> "ios"; "chrome" -> "chrome"; "firefox" -> "firefox"; else -> "edge"
+    }
+
+    // Перенести всё это в ядра — перед каждой сборкой конфига.
+    fun applyTuning() {
+        ConfigBuilder.deviceFp = deviceFingerprint()
+        ConfigBuilder.blockQuic = blockQuic
+        ConfigBuilder.tunStack = tunStack
+        XrayEngine.muxOn = muxOn
+        XrayEngine.fragOn = fragOn
+        XrayEngine.allowHeavy = tlsFpChoice in setOf("chrome", "firefox")
+    }
+
+    // Держать процессор бодрствующим, пока работает туннель (wakelock).
+    // Xiaomi/HyperOS усыпляет фон так, что туннель замирает, — у INCY это
+    // отдельная настройка «нужно на Xiaomi/HyperOS». По умолчанию — на них.
+    var holdAwake: Boolean
+        get() = sp.getBoolean("holdAwake", android.os.Build.MANUFACTURER.lowercase() in
+            setOf("xiaomi", "redmi", "poco"))
+        set(v) = sp.edit().putBoolean("holdAwake", v).apply()
+
+    // Ноды, что встают только через sing-box (Xray на них не пошёл) —
+    // для них «Авто» начинает с sing-box. См. NodeConfig.prefersXray.
+    fun singboxNodes(): Set<String> =
+        (sp.getString("singboxNodes", "") ?: "").split("\n").filter { it.isNotEmpty() }.toSet()
+    fun rememberSingboxNode(key: String) {
+        if (key.isEmpty() || key in singboxNodes()) return
+        sp.edit().putString("singboxNodes", (singboxNodes() + key).toList().takeLast(200).joinToString("\n")).apply()
+    }
+    fun forgetSingboxNode(key: String) {
+        val cur = singboxNodes(); if (key !in cur) return
+        sp.edit().putString("singboxNodes", (cur - key).joinToString("\n")).apply()
+    }
+
     // Режимы работы (можно оба сразу — «Режим БОГА»).
     var vpnEnabled: Boolean
         get() = sp.getBoolean("vpnOn", true)
@@ -288,12 +358,35 @@ class Prefs(context: Context) {
         val keys = nodeLabelKeys()
         val names = current.map { it.name }.toSet()
         val moved = mutableListOf<Pair<String, String>>()
+        // Тот же сервер под другим адресом. 09.11 Триллер стал отдавать
+        // каскады не по имени mos.thriller4ag.com, а прямо по IP
+        // 193.111.204.137 — с теми же портами, — и метки за 07.11 (Germany,
+        // Netherlands, France…) не нашли своих нод. Порт обязан совпасть, а
+        // адрес — либо имя, разрешённое в этот IP (Resolver.lastKnown), либо
+        // хотя бы само имя ноды: «Каскад Germany» ⊂ «Каскад Germany_awg
+        // (нейросети)».
+        fun words(s: String) = s.lowercase().split(Regex("[^\\p{L}\\p{N}]+")).filter { it.length > 1 }.toSet()
+        fun sameServer(key: String, oldName: String, n: com.zen.blaster.model.Node): Boolean {
+            val host = key.substringBeforeLast(':')
+            val port = key.substringAfterLast(':').toIntOrNull() ?: return false
+            if (n.port != port) return false
+            if (host == n.addr) return true
+            val a = Resolver.lastKnown(host) ?: host
+            val b = Resolver.lastKnown(n.addr) ?: n.addr
+            if (a == b) return true
+            val w = words(oldName)
+            return w.isNotEmpty() && words(n.name).containsAll(w)
+        }
+        val taken = labels.keys.toMutableSet()
         for ((old, label) in labels) {
             if (old in names) continue
             val key = keys[old] ?: continue
-            val n = current.firstOrNull { "${it.addr}:${it.port}" == key && it.name !in labels } ?: continue
+            val n = current.firstOrNull { "${it.addr}:${it.port}" == key && it.name !in taken }
+                ?: current.firstOrNull { it.name !in taken && sameServer(key, old, it) } ?: continue
             setNodeLabel(old, null)
-            setNodeLabel(n.name, label, key)
+            // Адрес — уже нынешний: следующий переезд пойдёт от него.
+            setNodeLabel(n.name, label, "${n.addr}:${n.port}")
+            taken += n.name
             moved += old to n.name
         }
         // Старым меткам без адреса (поставлены до 3.7.5) — адрес текущей ноды.
@@ -462,6 +555,11 @@ class Prefs(context: Context) {
         sp.edit().putString("rejectedCore_$slot", version).apply()
     }
 
+    // Когда последний раз просили снять экономию батареи (не чаще раза в неделю).
+    var batteryAskedAt: Long
+        get() = sp.getLong("batteryAskedAt", 0L)
+        set(v) = sp.edit().putLong("batteryAskedAt", v).apply()
+
     var lastCoreCheck: Long
         get() = sp.getLong("lastCoreCheck", 0L)
         set(v) = sp.edit().putLong("lastCoreCheck", v).apply()
@@ -524,9 +622,13 @@ class Prefs(context: Context) {
     // (см. ConfigBuilder.deviceFp: почему не новый каждую сессию).
     fun deviceFingerprint(): String {
         val cur = sp.getString("tlsFp", "") ?: ""
-        if (cur.isNotEmpty()) return cur
+        // Один раз пересадить с «тяжёлого» отпечатка (chrome/firefox/safari —
+        // приветствие с постквантовым ключом больше пакета, 10.11.2026 такие
+        // перестали проходить) на лёгкий. Флаг — чтобы выбор человека, если он
+        // потом поставит chrome сам, больше не трогать.
+        if (cur.isNotEmpty() && (cur !in ConfigBuilder.HEAVY_FP || sp.getBoolean("tlsFpLight", false))) return cur
         val fp = ConfigBuilder.freshFingerprint()
-        sp.edit().putString("tlsFp", fp).apply()
+        sp.edit().putString("tlsFp", fp).putBoolean("tlsFpLight", true).apply()
         return fp
     }
 

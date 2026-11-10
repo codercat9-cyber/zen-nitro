@@ -51,7 +51,9 @@ object XrayConfigParser {
                 val cfg = arr.optJSONObject(i) ?: continue
                 val name = cfg.optString("remarks").ifEmpty { "config-${i + 1}" }
                 if (isStub(name)) continue          // заглушка — не нода
-                nodeFrom(cfg, name)?.let { out.add(it) }
+                // Группа (несколько серверов, балансировщик) — запомнить конфиг
+                // целиком: Xray поднимет его как есть, со всеми запасными.
+                nodeFrom(cfg, name)?.let { out.add(if (isGroup(cfg)) it.copy(raw = cfg.toString()) else it) }
             }
         } catch (_: Throwable) {}
         return out
@@ -96,6 +98,59 @@ object XrayConfigParser {
         val names = (0 until arr.length()).mapNotNull { arr.optJSONObject(it)?.optString("remarks") }
         names.firstOrNull { isStub(it) }
     } catch (_: Throwable) { null }
+
+    // ГРУППЫ ВНУТРИ ГОТОВОГО КОНФИГА — честно в журнал.
+    //
+    // «АВТО ВЫБОР ( ЛУЧШИЙ )» у Пантеры в клиентах на Xray/sing-box может
+    // быть не одним сервером, а балансировщиком (routing.balancers +
+    // observatory у Xray, urltest у sing-box) на несколько серверов: клиент
+    // сам уходит с того, что завис. Мы из такого конфига берём один выход —
+    // и запасных нет. Пока это так, журнал должен прямо говорить, что в
+    // подписке была группа и сколько в ней серверов.
+    private val PROXY = setOf("vless", "vmess", "trojan", "shadowsocks", "hysteria", "hysteria2", "tuic", "wireguard")
+
+    // Группа ли это: два и больше настоящих выхода или балансировщик.
+    fun isGroup(cfg: JSONObject): Boolean {
+        val outs = cfg.optJSONArray("outbounds") ?: return false
+        val proxies = (0 until outs.length()).count { outs.optJSONObject(it)?.optString("protocol") in PROXY }
+        return proxies >= 2 || (cfg.optJSONObject("routing")?.optJSONArray("balancers")?.length() ?: 0) > 0
+    }
+
+    fun groups(body: String): List<String> = try {
+        val t = body.trimStart()
+        val arr = if (t.startsWith("[")) JSONArray(t) else JSONArray().put(JSONObject(t))
+        val out = mutableListOf<String>()
+        for (i in 0 until arr.length()) {
+            val cfg = arr.optJSONObject(i) ?: continue
+            val outs = cfg.optJSONArray("outbounds") ?: continue
+            val name = cfg.optString("remarks").ifEmpty { "конфиг ${i + 1}" }
+            // sing-box: urltest/selector со списком выходов.
+            for (j in 0 until outs.length()) {
+                val o = outs.optJSONObject(j) ?: continue
+                val type = o.optString("type")
+                if (type == "urltest" || type == "selector") {
+                    val n = o.optJSONArray("outbounds")?.length() ?: 0
+                    if (n >= 2) out += "«${o.optString("tag")}»: группа $type на $n выходов — берём их по одному, автовыбора нет"
+                }
+            }
+            // Xray: несколько настоящих выходов и/или балансировщик.
+            val proxies = (0 until outs.length()).mapNotNull { outs.optJSONObject(it) }
+                .filter { it.optString("protocol") in PROXY }
+            val bal = cfg.optJSONObject("routing")?.optJSONArray("balancers")
+            if (proxies.size >= 2 || (bal?.length() ?: 0) > 0) {
+                val addrs = proxies.take(4).joinToString(", ") { p ->
+                    val s = p.optJSONObject("settings")
+                    val v = s?.optJSONArray("vnext")?.optJSONObject(0) ?: s?.optJSONArray("servers")?.optJSONObject(0) ?: s
+                    "${v?.optString("address")}:${v?.optInt("port")}"
+                } + if (proxies.size > 4) " …" else ""
+                val strategy = bal?.optJSONObject(0)?.optJSONObject("strategy")?.optString("type").orEmpty()
+                out += "«$name»: ${proxies.size} серверов ($addrs)" +
+                    (if ((bal?.length() ?: 0) > 0) ", балансировщик ${strategy.ifEmpty { "random" }}" else "") +
+                    " — мы берём только первый, запасных у этой ноды нет"
+            }
+        }
+        out
+    } catch (_: Throwable) { emptyList() }
 
     private fun nodeFrom(cfg: JSONObject, name: String): Node? {
         val outs = cfg.optJSONArray("outbounds") ?: return null

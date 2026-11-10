@@ -98,6 +98,11 @@ class MainActivity : ComponentActivity() {
     // Идёт ли замер пинга / проверка канала — от двойных нажатий.
     @Volatile private var pingBusy = false
     @Volatile private var probeBusy = false
+    // Итог «проверки» и «обновить» — строкой прямо под кнопками в списке.
+    // Раньше он уходил только во вкладку «Журнал»: человек жал, в списке не
+    // менялось ничего, и казалось, что кнопки не работают (09.11).
+    private val pickerStatus = mutableStateOf("")
+    private val probing = mutableStateOf(false)
 
     // Обновление приложения.
     //   update      — что лежит снаружи; null = всё свежее, кнопки нет вовсе
@@ -125,6 +130,7 @@ class MainActivity : ComponentActivity() {
     private val showModesDlg = mutableStateOf(false)
     private val showJournal = mutableStateOf(false)
     private val showLeaks = mutableStateOf(false)
+    private val showBattery = mutableStateOf(false)
 
     // Как часто перемерять пинг всего списка сам по себе.
     private val PING_EVERY = 30 * 60_000L
@@ -361,11 +367,32 @@ class MainActivity : ComponentActivity() {
     }
 
     // Запрос разрешения VPN (VpnService.prepare).
+    private var vpnAskedAt = 0L
+    private fun askVpn(prep: Intent) {
+        vpnAskedAt = android.os.SystemClock.elapsedRealtime()
+        vpnPermission.launch(prep)
+    }
     private val vpnPermission = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
         if (res.resultCode == RESULT_OK) {
             pendingAwg?.let { startAwg(it); pendingAwg = null }
                 ?: pendingConfig?.let { startTunnel(it) }
-        } else { connState.intValue = 0; pendingAwg = null; log("❌ Разрешение VPN не выдано") }
+        } else {
+            connState.intValue = 0; pendingAwg = null; log("❌ Разрешение VPN не выдано")
+            // Отказ быстрее, чем человек успел бы прочесть окно, — значит,
+            // окна и не было (подсказка из INCY). На Xiaomi/HyperOS система
+            // молча глушит его без «всплывающих окон в фоне»; везде — если
+            // «Постоянная VPN» закреплена за другим приложением.
+            if (android.os.SystemClock.elapsedRealtime() - vpnAskedAt < 800) {
+                val xiaomi = Build.MANUFACTURER.lowercase().let { m ->
+                    m.contains("xiaomi") || m.contains("redmi") || m.contains("poco") }
+                val hint = (if (xiaomi) "Окно запроса VPN не показалось. На Xiaomi/HyperOS: " +
+                    "Настройки → Приложения → Zen Nitro → Другие разрешения → " +
+                    "«Всплывающие окна при работе в фоне» — включите. " else
+                    "Окно запроса VPN не показалось. ") +
+                    "Проверьте ещё «Постоянную VPN» в настройках VPN: она не должна стоять у другого приложения."
+                log("💡 $hint"); toast(hint)
+            }
+        }
     }
 
     // Android 13+ требует runtime-разрешение, иначе уведомление в шторке
@@ -399,7 +426,7 @@ class MainActivity : ComponentActivity() {
         com.zen.blaster.core.DnsChoice.fromSub = prefs.autoDns
         com.zen.blaster.core.Resolver.preferred = prefs.preDnsUrl()
         com.zen.blaster.core.Resolver.attach(this)
-        ConfigBuilder.deviceFp = prefs.deviceFingerprint()
+        prefs.applyTuning()
         // Основа HWID для панелей с лимитом устройств (см. Subscriptions.device):
         // ANDROID_ID постоянен для пары «устройство + ключ подписи приложения».
         com.zen.blaster.core.Subscriptions.deviceId = try {
@@ -439,11 +466,12 @@ class MainActivity : ComponentActivity() {
                 // Встала откатом на Xray — запоминаем; встала откатом на
                 // sing-box — значит, Xray ей больше не обязателен.
                 when (attemptForceXray) {
-                    true -> if (traitKey(n) !in prefs.xrayNodes()) {
+                    true -> if (traitKey(n) !in prefs.xrayNodes() || traitKey(n) in prefs.singboxNodes()) {
+                        prefs.forgetSingboxNode(traitKey(n))
                         prefs.rememberXrayNode(traitKey(n))
                         log("🧠 Запомнил: «${n.name}» — через Xray, в следующий раз сразу")
                     }
-                    false -> prefs.forgetXrayNode(traitKey(n))
+                    false -> { prefs.forgetXrayNode(traitKey(n)); prefs.rememberSingboxNode(traitKey(n)) }
                     null -> {}
                 }
                 cascadeTried.clear(); cascadeIdle = 0
@@ -794,6 +822,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         log("Загружаю подписки…")
+        pickerStatus.value = "обновляю подписки…"
         subsLoading.value = true
         subsLoadingAt = System.currentTimeMillis()
         lifecycleScope.launch {
@@ -957,10 +986,15 @@ class MainActivity : ComponentActivity() {
             // доступа, имя для TLS и путь. Разные ключи доступа к одному
             // серверу — разные ноды, их не трогаем. Оставляем живую копию,
             // а из живых — аварийную, потом подписку, потом ручную ссылку.
+            // Конфиг-группа (raw) при сведении не теряется: какая бы копия ни
+            // осталась, запасные серверы провайдера едут с ней.
+            val rawOf = (fresh + rescued + vanished).filter { it.raw.isNotEmpty() }
+                .associate { serverKey(it) to it.raw }
             val deduped = sameSub
                 .sortedWith(compareBy({ it.gone },
                     { when (it.sub) { WL_GROUP -> 0; "Свои ссылки" -> 2; else -> 1 } }))
                 .distinctBy { serverKey(it) }
+                .map { n -> if (n.raw.isEmpty()) rawOf[serverKey(n)]?.let { n.copy(raw = it) } ?: n else n }
             if (deduped.size < sameSub.size)
                 com.zen.blaster.core.Blackbox.note(
                     "♊ один сервер в нескольких подписках: ${sameSub.size} → ${deduped.size}")
@@ -1071,6 +1105,9 @@ class MainActivity : ComponentActivity() {
             relabel()
             pingTick.intValue++
             log("Загружено серверов: ${nodes.size}")
+            pickerStatus.value = "обновлено: ${nodes.size} серверов · " +
+                java.text.SimpleDateFormat("HH:mm", java.util.Locale.ROOT).format(java.util.Date())
+            toast("Подписки обновлены: ${nodes.size} серверов")
             // Разбивка по протоколам. Без неё пропажу целого протокола не
             // заметить: «85 серверов» выглядит прилично и тогда, когда все
             // ноды Hysteria2 из подписки потерялись по дороге.
@@ -1106,12 +1143,27 @@ class MainActivity : ComponentActivity() {
                 lost.take(5).forEach { log("   $it") }
                 if (lost.size > 5) log("   …и ещё ${lost.size - 5}")
             }
-            } finally { subsLoading.value = false }
+            } finally {
+                subsLoading.value = false
+                if (pickerStatus.value == "обновляю подписки…")
+                    pickerStatus.value = "обновить не вышло — подробности во вкладке «Журнал»"
+            }
         }
     }
 
     private fun toggle() {
         if (connState.intValue != 0) { stopTunnel(); return }
+        // ЭКОНОМИЯ БАТАРЕИ УСЫПЛЯЕТ ТУННЕЛЬ. 08–09.11: «3 замера подряд мимо
+        // за 1466 с» — телефон спал, сторож почти не просыпался, QUIC-сессия
+        // за это время умирала, а утром туннель рвали. Zen только писал об
+        // этом в журнал; INCY прямо просит разрешить работу в фоне. Просим и
+        // мы — не чаще раза в неделю, подключение от ответа не зависит.
+        val pm = getSystemService(POWER_SERVICE) as android.os.PowerManager
+        if (!pm.isIgnoringBatteryOptimizations(packageName) &&
+            System.currentTimeMillis() - prefs.batteryAskedAt > 7 * 24 * 3600_000L) {
+            prefs.batteryAskedAt = System.currentTimeMillis()
+            showBattery.value = true
+        }
         // Нажатие человека — новый каскад с чистого листа.
         cascadeTried.clear(); cascadeIdle = 0
         toggleConnect(force = false)
@@ -1254,16 +1306,23 @@ class MainActivity : ComponentActivity() {
     }
 
     // Проверка линии до ноды: мимо туннеля, по ступеням, с hex-дампом в журнал.
-    // Сама — не чаще раза в 10 минут на ноду: она тоже занимает канал.
+    // Сама — после КАЖДОГО «не поднялось», но не чаще раза в 2 минуты на ноду:
+    // откат на второе ядро и повтор той же ноды второго разбора не требуют.
+    // (Было раз в 10 минут и только когда оба ядра сдались — и на вопрос
+    // «почему не открылось» в журнале чаще всего не было ответа.)
     private val lineProbedAt = HashMap<String, Long>()
+
     private fun probeLine(n: Node, manual: Boolean) {
         val k = traitKey(n)
-        if (!manual && System.currentTimeMillis() - (lineProbedAt[k] ?: 0L) < 10 * 60_000L) return
+        if (!manual && System.currentTimeMillis() - (lineProbedAt[k] ?: 0L) < 2 * 60_000L) return
         lineProbedAt[k] = System.currentTimeMillis()
-        if (manual) toast("Проверяю линию до «${n.name}»…")
+        if (manual) { probing.value = true; pickerStatus.value = "" }
         log("🩺 Проверка линии до «${n.name}»…")
+        // След ядра — сейчас: следующая попытка его обнулит.
+        val trail = com.zen.blaster.core.CoreTrail.lines()
+        val trailCode = com.zen.blaster.core.CoreTrail.code()
         lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
-            val r = com.zen.blaster.core.LineProbe.run(n)
+            val r = com.zen.blaster.core.LineProbe.run(n, trail, trailCode)
             com.zen.blaster.core.Blackbox.note("🩺 проверка линии до «${n.name}» ${n.addr}:${n.port} · " +
                 com.zen.blaster.core.NetInfo.line(this@MainActivity))
             r.lines.forEach { com.zen.blaster.core.Blackbox.note("   $it") }
@@ -1278,7 +1337,10 @@ class MainActivity : ComponentActivity() {
             runOnUiThread {
                 r.lines.forEach { log("   $it") }
                 log("🩺 ${r.verdict}")
-                if (manual) toast(r.verdict.take(140))
+                // На экране — ничего, кроме «проверяю…» на кнопке: и абзац
+                // вердикта, и короткий итог только мешали (09.11: «спрячь»,
+                // «тоже в журнал»). Весь разбор с байтами — в журнале.
+                if (manual) probing.value = false
             }
         }
     }
@@ -1293,8 +1355,9 @@ class MainActivity : ComponentActivity() {
                 ?: toast("Сервер не выбран")
             return
         }
-        if (probeBusy) { log("⏳ Проверка уже идёт"); return }
-        probeBusy = true
+        if (probeBusy) { toast("Проверка уже идёт"); return }
+        probeBusy = true; probing.value = true
+        pickerStatus.value = "проверяю канал через «${Stats.server.value}»…"
         log("🔎 Проверяю ответ сервера…")
         val awg = engine.intValue == 1
         lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
@@ -1302,8 +1365,7 @@ class MainActivity : ComponentActivity() {
             val targets = listOf(
                 "Cloudflare" to "http://cp.cloudflare.com/generate_204",
                 "Google" to "https://www.gstatic.com/generate_204",
-                "YouTube" to "https://www.youtube.com/generate_204",
-                "DNS" to "https://dns.google/generate_204"
+                "YouTube" to "https://www.youtube.com/generate_204"
             )
             val http = okhttp3.OkHttpClient.Builder()
                 .connectTimeout(4, java.util.concurrent.TimeUnit.SECONDS)
@@ -1327,20 +1389,40 @@ class MainActivity : ComponentActivity() {
             } catch (_: Throwable) { -1 }
             // Все четыре РАЗОМ: по очереди с таймаутами это до 48 секунд,
             // человек успевал решить, что кнопка зависла, и нажать ещё раз.
+            // DNS — у DNS самого туннеля (clash_api /dns/query), а не стуком
+            // на dns.google: его ТСПУ режет всегда, и там был вечный ✖.
+            fun dnsViaCore(): Int = try {
+                val t0 = System.currentTimeMillis()
+                val r = com.zen.blaster.core.ClashApi.req("/dns/query?name=www.wikipedia.org&type=A").build()
+                val body = http.newCall(r).execute().use { it.body?.string().orEmpty() }
+                if ((org.json.JSONObject(body).optJSONArray("Answer")?.length() ?: 0) > 0)
+                    (System.currentTimeMillis() - t0).toInt().coerceAtLeast(1) else -1
+            } catch (t: Throwable) { if (t is java.net.ConnectException) -2 else -1 }
             val res = kotlinx.coroutines.coroutineScope {
-                targets.map { (name, url) ->
+                (targets.map { (name, url) ->
                     async { name to (if (awg) direct(url) else viaCore(url)) }
-                }.map { it.await() }
+                } + (if (awg) emptyList() else listOf(async { "DNS" to dnsViaCore() }))).map { it.await() }
             }
             runOnUiThread {
-                if (res.all { it.second == -2 }) {
+                val summary = if (res.all { it.second == -2 }) {
                     log("   ❌ Ядро не отвечает на управляющий порт — переподключитесь")
-                } else for ((name, ms) in res) {
-                    log(if (ms > 0) "   ✅ $name: $ms мс" else "   ❌ $name: нет ответа")
-                    if (name == "Cloudflare" && ms > 0) Stats.feedPing(ms)
+                    "ядро не отвечает — переподключитесь"
+                } else {
+                    for ((name, ms) in res) {
+                        log(if (ms > 0) "   ✅ $name: $ms мс" else "   ❌ $name: нет ответа")
+                        if (name == "Cloudflare" && ms > 0) Stats.feedPing(ms)
+                    }
+                    res.joinToString(" · ") { (name, ms) -> if (ms > 0) "$name $ms мс" else "$name ✖" }
                 }
+                pickerStatus.value = "проверка: $summary"
+                toast(summary)
+                // Что-то не открылось — сразу ответ «почему» по байтам: линия до
+                // текущей ноды мимо туннеля, с дампом и следом ядра.
+                if (!awg && res.any { it.second <= 0 })
+                    (nodes.firstOrNull { keyOf(it) == prefs.connectedKey } ?: nodes.getOrNull(selected.intValue))
+                        ?.let { probeLine(it, manual = true) }
             }
-            } finally { probeBusy = false }
+            } finally { probeBusy = false; runOnUiThread { probing.value = false } }
         }
     }
 
@@ -1510,7 +1592,7 @@ class MainActivity : ComponentActivity() {
         val selfXray = n != null && traitKey(n) in xr
         val neighbours = n?.let { com.zen.blaster.core.NodeConfig.xrayNeighbours(prefs, it) } ?: 0
         val remembered = n != null && XrayEngine.bothPossible(n) && (selfXray || neighbours >= 2)
-        val autoXray = vpnOn && n != null && (XrayEngine.handles(n) || remembered) && XrayEngine.available(this)
+        val autoXray = vpnOn && n != null && com.zen.blaster.core.NodeConfig.prefersXray(this, prefs, n)
         if (remembered && forceXray == null && prefs.tunnelEngine == 0)
             log(if (selfXray) "🧠 «${n!!.name}» в прошлый раз поднялась только через Xray — сразу через него"
                 else "🧠 Соседи «${n!!.name}» по входу ${n.addr} ($neighbours) встают только через Xray — сразу через него")
@@ -1531,6 +1613,7 @@ class MainActivity : ComponentActivity() {
                 "скорее всего не поднимется. Верните «Авто».")
         if (pinned == 2 && !XrayEngine.available(this))
             log("⚠️ Выбран Xray, но его бинарник недоступен — иду через sing-box")
+        prefs.applyTuning()     // переключатели настроек — в ядра, до сборки конфига
         val fp = if (prefs.armor) ConfigBuilder.pickFingerprint() else ""
         // Режим белых списков: прикрываемся разрешённым доменом.
         // У аварийной ноды прикрытие включается САМО: она для того и заведена,
@@ -1591,7 +1674,10 @@ class MainActivity : ComponentActivity() {
         }
         pendingXray = if (viaXray) {
             val bait = com.zen.blaster.core.AwgBait.fromProfiles(prefs.awgProfiles())
-            if (n!!.type == "Hysteria2")
+            if (n!!.raw.isNotEmpty())
+                log("⚖ Группа провайдера целиком: ${com.zen.blaster.core.XrayEngine.groupSize(n)} серверов " +
+                    "с балансировщиком → ядро Xray: зависнет один — Xray сам уйдёт на другой (как у INCY)")
+            else if (n.type == "Hysteria2")
                 log("🧩 Hysteria2 → ядро Xray" + (if (prefs.armor && !n.wl)
                     " · шум перед рукопожатием как у Amnezia" +
                         (if (bait.isNotEmpty()) " (приманки I1–I5 из AWG-профиля: ${bait.size})" else "")
@@ -1628,13 +1714,22 @@ class MainActivity : ComponentActivity() {
             if (bd > 0) log("⚡ Hysteria2 в режиме Brutal: $bd↓ / $bu↑ Мбит/с")
             else log("🌊 Hysteria2 на BBR — канал слишком узкий для заявленного темпа")
         }
+        // У группы провайдера конфиг его — нашей брони там нет, и врать о ней незачем.
+        // Журнал называет то, что реально уходит в провод: отпечаток (edge —
+        // приветствие в один пакет) и нарезку приветствия у Xray (выход frag).
         if (prefs.armor) log(
             if (hyViaXray) "🛡 Броня: шум перед рукопожатием (как у Amnezia), IPv6 off"
-            else "🛡 Броня: отпечаток ${if (viaXray) fp else ConfigBuilder.lastFingerprint}, " +
-                "padding, xudp, IPv6 off" + if (dpiOn) ", фрагментация TLS (ByeDPI)" else "")
+            else if (n?.raw?.isNotEmpty() == true && n?.wl != true) "🛡 Броня группы: отпечаток → ${com.zen.blaster.core.XrayEngine.LIGHT_FP} (Chrome 120 без постквантового ключа)" + (if (prefs.fragOn) ", нарезка приветствия по 100–200 Б" else "")
+            else if (n?.raw?.isNotEmpty() == true) "🛡 Аварийная группа — конфиг провайдера как есть"
+            else "🛡 Броня: отпечаток ${if (viaXray) com.zen.blaster.core.XrayEngine.xrayFp(fp, n?.pbk?.isNotEmpty() == true) else ConfigBuilder.lastFingerprint}" +
+                (if (viaXray && dpiOn && prefs.chainVpnViaDpi) ", через ByeDPI"
+                 else if (viaXray && n?.wl != true && prefs.fragOn) ", нарезка приветствия по 100–200 Б" else "") +
+                (if (viaXray && prefs.muxOn) ", mux" else "") +
+                ", IPv6 off" + (if (prefs.blockQuic && n?.quic() != true) ", QUIC → TCP" else "") +
+                if (dpiOn) ", фрагментация TLS (ByeDPI)" else "")
         // В режиме прокси системный VPN не поднимается — согласие не нужно.
         val prep = if (proxyMode) null else VpnService.prepare(this)
-        if (prep != null) { pendingConfig = config; vpnPermission.launch(prep) }
+        if (prep != null) { pendingConfig = config; askVpn(prep) }
         else startTunnel(config)
 
         // Откат на второе ядро — в ОБЕ стороны.
@@ -1766,6 +1861,7 @@ class MainActivity : ComponentActivity() {
                     log("↩ Модуль Xray $mv не поднял ноду — пробую встроенное ядро")
                     com.zen.blaster.core.Blackbox.outcome(false,
                         "модуль Xray $mv не поднял ноду за ${waitMs / 1000} с — пробую встроенное ядро")
+                    probeLine(n, manual = false)          // разбор по байтам — пока след ядра свежий
                     com.zen.blaster.core.XrayEngine.builtinNext = true
                     stopTunnel()
                     kotlinx.coroutines.delay(900)
@@ -1795,6 +1891,7 @@ class MainActivity : ComponentActivity() {
                         if (rejected) "sing-box: сервер отказал в рукопожатии Reality — перехожу на Xray"
                         else "${if (viaXray) "Xray" else "sing-box"} не отозвался за " +
                         "${waitMs / 1000} с — перехожу на второе ядро")
+                    probeLine(n, manual = false)          // разбор по байтам — пока след ядра свежий
                     stopTunnel()
                     kotlinx.coroutines.delay(900)
                     connState.intValue = 1
@@ -1900,6 +1997,14 @@ class MainActivity : ComponentActivity() {
                     com.zen.blaster.core.RadioKick.kick(this@MainActivity, "сеть молчит") { m -> runOnUiThread { log(m) } }
                     com.zen.blaster.core.Blackbox.note("↻ каскад: сеть не держит, пауза ${pause / 1000} с")
                     kotlinx.coroutines.delay(pause)
+                } else if (!prefs.autoSwitchNode) {
+                    // Куда просили: та же нода, ядра она уже пробовала; ждём и
+                    // повторяем, как INCY. На другую — только если включено.
+                    cascadeIdle++
+                    val pause = (8_000L shl cascadeIdle.coerceAtMost(2)).coerceAtMost(30_000L)
+                    log("↻ «${nodes.getOrNull(selected.intValue)?.name}» пока не встаёт — пробую её же через ${pause / 1000} с " +
+                        "(сам на другие ноды не перехожу — это в настройках)")
+                    kotlinx.coroutines.delay(pause)
                 } else {
                     cascadeIdle = 0
                     val next = nextCascadeNode(v.whitelist)
@@ -1938,7 +2043,7 @@ class MainActivity : ComponentActivity() {
         Stats.mode.value = p.badge()
         val json = p.toJson().toString()
         val prep = VpnService.prepare(this)
-        if (prep != null) { pendingAwg = json; pendingConfig = null; vpnPermission.launch(prep) }
+        if (prep != null) { pendingAwg = json; pendingConfig = null; askVpn(prep) }
         else startAwg(json)
     }
 
@@ -2089,6 +2194,7 @@ class MainActivity : ComponentActivity() {
         if (showModesDlg.value) ModesDialog()
         if (showJournal.value) JournalDialog()
         if (showLeaks.value) LeaksDialog()
+        if (showBattery.value) BatteryDialog()
     }
 
     // ПРОВЕРКА УТЕЧЕК: что о вас видно снаружи.
@@ -2758,6 +2864,35 @@ class MainActivity : ComponentActivity() {
     // человеку поменять. Меняется сразу, без «применить» — видно на самом
     // заголовке за спиной у окошка.
     @Composable
+    private fun BatteryDialog() {
+        AlertDialog(
+            onDismissRequest = { showBattery.value = false },
+            containerColor = ZenCard,
+            title = { Text("Разрешите работу в фоне", color = Color.White, fontSize = 17.sp) },
+            text = {
+                Text("Android сейчас может усыплять Zen ради экономии батареи — и туннель " +
+                    "замирает в кармане, а потом рвётся. Особенно на Xiaomi/HyperOS. " +
+                    "Разрешите Zen работать без ограничений — соединение будет держаться.",
+                    color = ZenGray, fontSize = 13.sp)
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showBattery.value = false
+                    runCatching {
+                        startActivity(Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                            android.net.Uri.parse("package:$packageName")))
+                    }.onFailure {
+                        runCatching { startActivity(Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
+                    }
+                }) { Text("РАЗРЕШИТЬ", color = ZenCyan) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showBattery.value = false }) { Text("НЕ СЕЙЧАС", color = ZenGray) }
+            }
+        )
+    }
+
+    @Composable
     private fun TitleDialog() {
         AlertDialog(
             onDismissRequest = { showTitleDlg.value = false },
@@ -2962,8 +3097,18 @@ class MainActivity : ComponentActivity() {
                 ) {
                     val pd = pingDone.intValue
                     ActionChip(if (pd >= 0) "пинг $pd/${pingTotal.intValue}" else "пинг") { repingAll() }
-                    ActionChip("проверка") { probeActive() }
-                    ActionChip("обновить") { loadServers() }
+                    ActionChip(if (probing.value) "проверяю…" else "проверка") { probeActive() }
+                    ActionChip(if (subsLoading.value) "обновляю…" else "обновить") { loadServers() }
+                }
+                // Итог кнопок — две строки, по нажатию целиком. Вердикт проверки
+                // линии бывает в абзац и выталкивал список (09.11: видна одна
+                // нода); полностью он и так лежит в журнале.
+                if (pickerStatus.value.isNotEmpty()) {
+                    var full by remember(pickerStatus.value) { mutableStateOf(false) }
+                    Text(pickerStatus.value, color = ZenGray, fontSize = 12.sp, lineHeight = 15.sp,
+                        maxLines = if (full) 12 else 2,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(horizontal = 20.dp).clickable { full = !full })
                 }
                 // Что можно убрать крестиком разом. Выбранную не трогаем:
                 // убирать сервер, на котором сидишь, — это другое действие.
@@ -3090,7 +3235,10 @@ class MainActivity : ComponentActivity() {
                                             active -> ZenCyan
                                             else -> Color.White
                                         },
-                                        fontSize = 16.sp, maxLines = 1, softWrap = false,
+                                        // До трёх строк: метка живёт ниже, имени ничто не мешает,
+                                        // а длинное «⚡ Умный маршрут (СПб · ЕКБ · НСК)» в
+                                        // одну строку теряло хвост (09.11).
+                                        fontSize = 16.sp, maxLines = 3, lineHeight = 19.sp,
                                         overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                                         modifier = Modifier.weight(1f, fill = false))
                                 }
@@ -3536,22 +3684,30 @@ class MainActivity : ComponentActivity() {
             val silent = state == 2 && stage.startsWith("Канал молчит")
             val shaky = state == 2 && !dead && (stage.startsWith("Переподключаюсь") ||
                 stage.startsWith("Поднимаю ядро") || stage.startsWith("Проверяю канал") || noNet || silent)
+            val label = when {
+                dead -> "Нет связи"
+                noNet -> "Нет сети"
+                silent -> "Связь пропала…"
+                shaky -> "Переподключаюсь…"
+                state == 2 -> "Подключено"
+                state == 1 -> "Подключение…"
+                else -> "Подключиться"
+            }
+            // НАДПИСЬ — ВНУТРИ КОЛЬЦА. «Переподключаюсь…» при крупном шрифте
+            // системы (Xiaomi) вылезала за кольцо (09.11). Ширина — по
+            // внутреннему диаметру; не влезает — шрифт меньше, пока не влезет.
+            var fit by remember(label) { mutableIntStateOf(if (shaky) 22 else 26) }
             Text(
-                when {
-                    dead -> "Нет связи"
-                    noNet -> "Нет сети"
-                    silent -> "Связь пропала…"
-                    shaky -> "Переподключаюсь…"
-                    state == 2 -> "Подключено"
-                    state == 1 -> "Подключение…"
-                    else -> "Подключиться"
-                },
+                label,
                 color = when {
                     dead || shaky -> Color(0xFFE87A3A)
                     state == 2 -> ringColor
                     else -> Color.White
                 },
-                fontWeight = FontWeight.Normal, fontSize = if (shaky) 22.sp else 26.sp
+                fontWeight = FontWeight.Normal, fontSize = fit.sp,
+                maxLines = 1, softWrap = false, textAlign = TextAlign.Center,
+                onTextLayout = { if (it.hasVisualOverflow && fit > 12) fit -= 1 },
+                modifier = Modifier.widthIn(max = 180.dp)
             )
         }
     }
@@ -4479,6 +4635,11 @@ class MainActivity : ComponentActivity() {
             ) { Text("ОТКРЫТЬ СИСТЕМНЫЕ НАСТРОЙКИ VPN", color = Color.White, fontSize = 13.sp) }
             ToggleRow("Только IPv4 → IPv6", prefs.ipv6) { prefs.ipv6 = it }
             ToggleRow("Авто-реконнект при обрыве", prefs.autoReconnect) { prefs.autoReconnect = it }
+            ToggleRow("Сам переходить на другую ноду, если выбранная не встаёт", prefs.autoSwitchNode) {
+                prefs.autoSwitchNode = it }
+            ToggleRow("Держать телефон бодрствующим, пока работает туннель (нужно на Xiaomi/HyperOS)",
+                prefs.holdAwake) { prefs.holdAwake = it }
+            TuningSection()
 
             Spacer(Modifier.height(20.dp))
             Text("ВНЕШНИЙ ВИД", color = ZenRed, fontWeight = FontWeight.Bold)
@@ -4710,6 +4871,47 @@ class MainActivity : ComponentActivity() {
             Text(label, color = Color.White, modifier = Modifier.weight(1f), fontSize = 13.sp)
             Switch(checked = checked, onCheckedChange = { checked = it; onChange(it) })
         }
+    }
+
+    // Выбор из нескольких значений: нажатие — следующее по кругу.
+    @Composable
+    private fun ChoiceRow(label: String, options: List<Pair<String, String>>, initial: String,
+                          onChange: (String) -> Unit) {
+        var cur by remember { mutableStateOf(initial) }
+        val i = options.indexOfFirst { it.first == cur }.coerceAtLeast(0)
+        Row(Modifier.fillMaxWidth().padding(vertical = 6.dp).clickable {
+                cur = options[(i + 1) % options.size].first; onChange(cur)
+            }, verticalAlignment = Alignment.CenterVertically) {
+            Text(label, color = Color.White, modifier = Modifier.weight(1f), fontSize = 13.sp)
+            Text(options[i].second + "  ▸", color = ZenCyan, fontSize = 13.sp)
+        }
+    }
+
+    // ТОНКАЯ НАСТРОЙКА СОЕДИНЕНИЯ — 10.11.2026, после того как VLESS и Reality
+    // встали у всех: каждая вещь, которая меняет байты в проводе, — под рукой
+    // и с честным описанием. Применяется при следующем подключении.
+    @Composable
+    private fun TuningSection() {
+        Spacer(Modifier.height(20.dp))
+        Text("СОЕДИНЕНИЕ · VLESS / REALITY", color = ZenRed, fontWeight = FontWeight.Bold)
+        Text("Применяется при следующем подключении. Умолчания — по замерам на телефоне.",
+            color = ZenGray, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp))
+        ToggleRow("Мультиплексирование (Mux) — несколько потоков в одном соединении. " +
+            "Выкл., как у INCY и Karing: придушат одно соединение — встанет всё", prefs.muxOn) {
+            prefs.muxOn = it }
+        ToggleRow("Нарезка TLS-приветствия (фрагментация, 100–200 Б) — против DPI", prefs.fragOn) {
+            prefs.fragOn = it }
+        ToggleRow("Блокировать QUIC на TCP-нодах — YouTube и Google сразу идут по TCP, а не висят",
+            prefs.blockQuic) { prefs.blockQuic = it }
+        ChoiceRow("Отпечаток TLS", listOf(
+            "light" to "Chrome 120 (лёгкий)", "ios" to "iOS", "chrome" to "Chrome (тяжёлый, 1,8 КБ)",
+            "firefox" to "Firefox (тяжёлый)"), prefs.tlsFpChoice) { prefs.tlsFpChoice = it }
+        ChoiceRow("Стек TUN", listOf(
+            "auto" to "авто", "gvisor" to "gvisor", "system" to "system", "mixed" to "mixed"),
+            prefs.tunStack) { prefs.tunStack = it }
+        Text("Стек «авто»: gvisor, когда трафик идёт через Xray (VLESS, Reality, XHTTP), иначе system. " +
+            "Через Xray всегда gvisor — со стеком system там не проходит TCP приложений.",
+            color = ZenGray, fontSize = 11.sp, modifier = Modifier.padding(top = 2.dp))
     }
 
     @Composable

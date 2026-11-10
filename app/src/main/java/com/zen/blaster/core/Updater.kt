@@ -62,18 +62,16 @@ object Updater {
     // VPN то же самое скачалось за 9 секунд. Привязываем и сокеты, и DNS к
     // физической сети — как пинг и проверка линии.
     private fun direct(): OkHttpClient {
-        val net = Resolver.physical() ?: return http
+        Resolver.physical() ?: return http
         return http.newBuilder()
-            .socketFactory(net.socketFactory)
-            .dns(object : okhttp3.Dns {
-                override fun lookup(hostname: String) = net.getAllByName(hostname).toList()
-            })
+            .socketFactory(Bypass.factory)
+            .dns(Bypass.dns)
             .build()
     }
 
-    // Раз в сутки. Чаще нет смысла, а на мобильном трафике каждый лишний
-    // запрос — это ещё и лишний след наружу.
-    private const val PERIOD_MS = 22L * 60 * 60 * 1000
+    // 10.11.2026: было 22 ч — после выкладки кнопка «Доступно обновление»
+    // появлялась у людей через сутки, и они лезли за ним в настройки.
+    private const val PERIOD_MS = 3L * 60 * 60 * 1000
 
     fun myCode(ctx: Context): Int = try {
         val pi = ctx.packageManager.getPackageInfo(ctx.packageName, 0)
@@ -113,13 +111,26 @@ object Updater {
             return@withContext null
 
         var httpCode = 0
-        val body = try {
-            http.newCall(Request.Builder().url(src).build())
-                .execute().use { r ->
-                    httpCode = r.code
-                    if (r.isSuccessful) r.body?.string().orEmpty() else ""
-                }
-        } catch (_: Exception) { "" }
+        // Напрямую, не вышло — через туннель (как и само скачивание ниже):
+        // с части мобильных сетей наш сервер напрямую недоступен (10.11,
+        // Билайн), и о новой версии человек не узнавал вовсе.
+        val ways = buildList {
+            add(direct())
+            if (com.zen.blaster.vpn.ZenVpnService.running) add(LocalProbe.through().newBuilder()
+                .addInterceptor { ch -> ch.proceed(ch.request().newBuilder().header("User-Agent", UA).build()) }
+                .build())
+        }
+        var body = ""
+        for (c in ways) {
+            body = try {
+                c.newCall(Request.Builder().url(src).build())
+                    .execute().use { r ->
+                        httpCode = r.code
+                        if (r.isSuccessful) r.body?.string().orEmpty() else ""
+                    }
+            } catch (_: Exception) { "" }
+            if (body.isNotBlank() || httpCode in 400..499) break
+        }
 
         if (body.isBlank()) {
             // Разделяем «не смог спросить» и «спросил, ответили что нечего».

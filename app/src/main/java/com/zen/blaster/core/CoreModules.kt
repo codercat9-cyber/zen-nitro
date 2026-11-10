@@ -151,6 +151,31 @@ object CoreModules {
         .callTimeout(120, java.util.concurrent.TimeUnit.SECONDS)
         .build()
 
+    // ДВА ПУТИ ДО СЕРВЕРА МОДУЛЕЙ: напрямую (мимо туннеля, через protect —
+    // см. Bypass), не вышло — через сам туннель. 10.11.2026, журнал с realme
+    // на Билайне: «storage-mess.online не ответил … after 8000ms» — с этой
+    // мобильной сети наш сервер напрямую недоступен, и ядра не доезжали
+    // вовсе («обновления ядер не всем долетают»). Через туннель — доедут.
+    private fun clients(): List<Pair<String, okhttp3.OkHttpClient>> = buildList {
+        add("напрямую" to Bypass.http(http()))
+        if (com.zen.blaster.vpn.ZenVpnService.running) add("через туннель" to LocalProbe.through().newBuilder()
+            .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+            .callTimeout(120, java.util.concurrent.TimeUnit.SECONDS).build())
+    }
+
+    // Первый путь, по которому сервер ответил успехом; null — ни по одному.
+    private fun openAny(r: okhttp3.Request, onLog: (String) -> Unit = {}): okhttp3.Response? {
+        for ((how, c) in clients()) {
+            try {
+                val resp = c.newCall(r).execute()
+                if (resp.isSuccessful) { if (how != "напрямую") onLog("↪ модули ядер — $how"); return resp }
+                resp.close()
+                onLog("… модули ядер $how: HTTP ${resp.code}")
+            } catch (t: Throwable) { onLog("… модули ядер $how: ${r.url.host} не ответил (${t.message?.take(80)})") }
+        }
+        return null
+    }
+
     // Наш сервер раздаёт обновления только своему клиенту — по имени в
     // User-Agent; без него отвечает 403.
     private fun req(url: String) = okhttp3.Request.Builder().url(url)
@@ -166,19 +191,14 @@ object CoreModules {
     // Теперь модули всех источников вместе, у каждого — свой адрес, а
     // выбор «что новее» делает тот, кто предлагает (coreOffers).
     fun fetch(ctx: Context, onLog: (String) -> Unit = {}): Catalog? {
-        val c = http()
         val all = mutableListOf<Module>()
         var first: String? = null
         for (src in sources(ctx)) {
             try {
-                val body = c.newCall(req(src + "cores.json")).execute().use {
-                    if (!it.isSuccessful) throw java.io.IOException("HTTP ${it.code}")
-                    it.body?.bytes() ?: ByteArray(0)
-                }
-                val sig = c.newCall(req(src + "cores.json.sig")).execute().use {
-                    if (!it.isSuccessful) throw java.io.IOException("подпись: HTTP ${it.code}")
-                    it.body?.string().orEmpty()
-                }
+                val body = openAny(req(src + "cores.json"), onLog)?.use { it.body?.bytes() ?: ByteArray(0) }
+                    ?: throw java.io.IOException("ни напрямую, ни через туннель")
+                val sig = openAny(req(src + "cores.json.sig"), onLog)?.use { it.body?.string().orEmpty() }
+                    ?: throw java.io.IOException("подпись: ни напрямую, ни через туннель")
                 if (!verify(body, sig)) {
                     onLog("⛔ Модули ядер: подпись манифеста не сошлась (${host(src)}) — не беру")
                     continue
@@ -220,8 +240,9 @@ object CoreModules {
         val tmp = File(dir, "download.tmp")
         try {
             onProgress("Качаю ${m.core} ${m.version}…")
-            http().newCall(req(m.source.ifEmpty { cat.source } + m.file)).execute().use { r ->
-                if (!r.isSuccessful) return "сервер ответил HTTP ${r.code}"
+            val resp = openAny(req(m.source.ifEmpty { cat.source } + m.file))
+                ?: return "сервер модулей недоступен ни напрямую, ни через туннель"
+            resp.use { r ->
                 val md = java.security.MessageDigest.getInstance("SHA-256")
                 var got = 0L
                 r.body!!.byteStream().use { inp ->

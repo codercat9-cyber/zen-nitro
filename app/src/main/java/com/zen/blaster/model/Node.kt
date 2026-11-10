@@ -40,6 +40,12 @@ data class Node(
     // с неверным числом сервер молча рвёт соединение.
     val alterId: Int = 0,
     val insecure: Boolean = false,
+    // Готовый конфиг Xray провайдера ЦЕЛИКОМ — когда «нода» на деле группа:
+    // несколько серверов и балансировщик («АВТО ВЫБОР» Пантеры — 13 серверов,
+    // «AUTO | Умный выбор» Sirius — 17). Такой конфиг Xray запускает как есть
+    // и сам уходит с зависшего сервера — так держит связь INCY. Пусто —
+    // обычная нода, конфиг собираем сами из полей выше.
+    val raw: String = "",
     // Из какой подписки пришла нода — нужно для группировки в списке.
     var sub: String = "",
     // Нода из аварийного (белосписочного) арсенала: к ней применяется
@@ -152,7 +158,7 @@ data class Node(
         .put("serviceName", serviceName).put("alpn", alpn).put("security", security)
         .put("fp", fp).put("obfs", obfs).put("obfsPw", obfsPw).put("cc", cc)
         .put("mode", mode).put("extra", extra).put("fm", fm).put("seed", seed).put("hopPorts", hopPorts)
-        .put("headerType", headerType).put("alterId", alterId).put("insecure", insecure)
+        .put("headerType", headerType).put("alterId", alterId).put("insecure", insecure).put("raw", raw)
         .put("sub", sub).put("wl", wl).put("ping", ping)
         .put("pingExact", pingExact).put("pingAt", pingAt).put("gone", gone).put("goneAt", goneAt)
         .put("silentTries", silentTries).put("lastOkAt", lastOkAt)
@@ -179,6 +185,7 @@ data class Node(
             extra = o.optString("extra"), fm = o.optString("fm"), seed = o.optString("seed"),
             hopPorts = o.optString("hopPorts"),
             headerType = o.optString("headerType"), alterId = o.optInt("alterId"), insecure = o.optBoolean("insecure"),
+            raw = o.optString("raw"),
             sub = o.optString("sub"), wl = o.optBoolean("wl"), ping = o.optInt("ping", -1),
             pingExact = o.optBoolean("pingExact", true),
             pingAt = o.optLong("pingAt", 0L),

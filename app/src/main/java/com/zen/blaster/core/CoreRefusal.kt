@@ -44,8 +44,14 @@ object CoreRefusal {
         // (прямой выход Xray — freedom — не про ноду).
         val xrayNode = Regex("proxy/(vless|vmess|trojan|shadowsocks|hysteria\\w*)/outbound").containsMatchIn(line)
         if (!line.contains("[proxy]") && !line.contains("process DNS packet") && !xrayNode) return null
-        return Regex("""dial tcp ([0-9a-fA-F.:\[\]]+): connect: connection refused""")
-            .find(line)?.groupValues?.get(1)
+        val target = Regex("""dial tcp ([0-9a-fA-F.:\[\]]+): connect: connection refused""")
+            .find(line)?.groupValues?.get(1) ?: return null
+        // Свой же локальный порт (Xray SOCKS, ByeDPI) — это не отказ сервера, а
+        // наш упавший помощник. Журнал 09.11 с realme: «до 127.0.0.1:38614
+        // сбрасывают (RST) — с этой сети к порту ноды не пускают» — неправда.
+        val host = target.substringBeforeLast(':').trim('[', ']')
+        if (host.startsWith("127.") || host == "::1" || host == "localhost") return null
+        return target
     }
 
     fun refusedText(target: String): String =

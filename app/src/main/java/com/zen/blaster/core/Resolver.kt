@@ -378,7 +378,9 @@ object Resolver {
         // Прибиваем сокет к настоящему каналу. Без этого запрос уходит по
         // «активной сети», а в момент подъёма туннеля активная сеть — это
         // наш же полумёртвый tun с DNS на 172.19.0.2.
-        net?.let { n -> runCatching { b.socketFactory(n.socketFactory) } }
+        // Через protect(), а не привязкой к сети: внутри своего туннеля
+        // привязку Android запрещает (EPERM) — см. Bypass.
+        b.socketFactory(Bypass.factory)
         val c = b.build()
         boundTo = net; client = c
         return c

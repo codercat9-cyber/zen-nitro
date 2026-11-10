@@ -24,6 +24,32 @@ object XrayEngine {
     // Порт по умолчанию — только для собранного заранее конфига. При каждом
     // подъёме берётся СЛУЧАЙНЫЙ свободный (см. claim), с паролем.
     const val SOCKS_PORT = 10809
+    // ОТПЕЧАТОК ДЛЯ XRAY — Chrome 120.
+    //
+    // Замер 10.11.2026 на Xray 26.10.10 (Reality, приветствие на локальный
+    // приёмник): chrome/131/133 — 1754–1818 байт, firefox — 1887, safari —
+    // 1535 (постквантовый ключ, больше пакета; в этот день такие перестали
+    // проходить ТСПУ). hellochrome_120 — 517–596 байт: настоящий Chrome, как
+    // на любом Android, с перетасовкой расширений, но ещё без ключа. Тот же
+    // выбор есть в INCY. «android» в uTLS — OkHttp из Android 11 без TLS 1.3:
+    // Reality с ним не стартует вовсе («Current fingerprint Android11 does not
+    // support TLS 1.3») — для Reality это тоже Chrome 120, браузер Android.
+    const val LIGHT_FP = "hellochrome_120"
+    // Тонкая настройка из Prefs.applyTuning(): mux, нарезка приветствия и
+    // «тяжёлый» отпечаток, если человек выбрал его сам.
+    @Volatile var muxOn = false
+    @Volatile var fragOn = true
+    @Volatile var allowHeavy = false
+    fun xrayFp(fp: String, reality: Boolean): String = when (fp.lowercase()) {
+        "chrome", "firefox", "safari" -> if (allowHeavy) fp else LIGHT_FP
+        "", "edge", "random", "randomized" -> LIGHT_FP
+        "android" -> if (reality) LIGHT_FP else "android"
+        else -> fp
+    }
+
+    // Выход-нарезчик: через него (dialerProxy) прокси дозванивается до сервера,
+    // и TLS-приветствие уходит кусками. См. buildConfig, «броня».
+    const val FRAG_TAG = "frag"
 
     // ПОРТ И ПАРОЛЬ SOCKS — НОВЫЕ НА КАЖДЫЙ ПОДЪЁМ.
     //
@@ -94,7 +120,7 @@ object XrayEngine {
 
     // Xray нужен не только из-за транспорта: VLESS Encryption sing-box не умеет
     // вовсе, поэтому такую ноду он поднять не сможет ни при каком транспорте.
-    fun handles(n: Node): Boolean =
+    fun handles(n: Node): Boolean = n.raw.isNotEmpty() ||
         n.type == "VLESS" &&
         (n.transport.lowercase() in XRAY_ONLY || n.encryption.isNotEmpty() || n.fm.isNotEmpty())
 
@@ -239,6 +265,7 @@ object XrayEngine {
                     p.inputStream.bufferedReader().forEachLine { line ->
                         if (line.isBlank()) return@forEachLine
                         android.util.Log.i("ZenXray", line)   // видно через adb logcat
+                        CoreTrail.feed(line)                  // след для разбора обрыва
                         // в UI-лог тащим только важное, иначе он захлёбывается
                         if (line.contains("[Warning]") || line.contains("[Error]") ||
                             line.contains("failed") || line.contains("started"))
@@ -290,16 +317,65 @@ object XrayEngine {
         if (changed) root.toString() else configJson
     } catch (_: Throwable) { configJson }
 
+    // Адреса серверов — нашим шифрованным DNS, ДО запуска Xray.
+    //
+    // Сам Xray (он вне туннеля) спросил бы DNS оператора, а тот подменяет
+    // ответы (журнал 09.11: «2 из 3»). Раньше так разрешался только первый
+    // выход; у конфига-группы серверов до трёх десятков — разрешаем все,
+    // параллельно. Имя для TLS и заголовок Host при этом сохраняем: без них
+    // Xray взял бы именем адрес, а это теперь IP.
     private fun resolveServer(configJson: String, onLog: (String) -> Unit): String = try {
         val obj = JSONObject(configJson)
-        val vnext = obj.getJSONArray("outbounds").getJSONObject(0)
-            .getJSONObject("settings").getJSONArray("vnext").getJSONObject(0)
-        val host = vnext.getString("address")
-        if (Resolver.isIpLiteral(host)) configJson else {
-            val ip = Resolver.resolve(host)
-            if (ip == null) { onLog("⚠️ Не удалось разрешить $host — Xray попробует сам"); configJson }
-            else { onLog("🔎 $host → $ip"); vnext.put("address", ip); obj.toString() }
+        val outs = obj.getJSONArray("outbounds")
+        // (выход, точка с адресом) для всех настоящих выходов.
+        val spots = mutableListOf<Pair<JSONObject, JSONObject>>()
+        for (i in 0 until outs.length()) {
+            val o = outs.optJSONObject(i) ?: continue
+            if (o.optString("protocol") !in PROXY) continue
+            val s = o.optJSONObject("settings") ?: continue
+            s.optJSONArray("vnext")?.let { a -> for (j in 0 until a.length()) a.optJSONObject(j)?.let { spots += o to it } }
+            s.optJSONArray("servers")?.let { a -> for (j in 0 until a.length()) a.optJSONObject(j)?.let { spots += o to it } }
+            if (s.has("address")) spots += o to s
         }
+        val hosts = spots.map { it.second.optString("address") }
+            .filter { it.isNotEmpty() && !Resolver.isIpLiteral(it) }.distinct()
+        val ips = HashMap<String, String?>()
+        if (hosts.size == 1) ips[hosts[0]] = Resolver.resolve(hosts[0])
+        else if (hosts.isNotEmpty()) {
+            val pool = java.util.concurrent.Executors.newFixedThreadPool(minOf(8, hosts.size))
+            try {
+                val fut = hosts.associateWith { h -> pool.submit(java.util.concurrent.Callable { Resolver.resolve(h) }) }
+                for ((h, f) in fut) ips[h] = try { f.get(6, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) { null }
+            } finally { pool.shutdownNow() }
+        }
+        for ((o, spot) in spots) {
+            val host = spot.optString("address")
+            val ip = ips[host] ?: continue
+            val ss = o.optJSONObject("streamSettings")
+            val tls = ss?.optJSONObject("tlsSettings")
+            val sni = tls?.optString("serverName").orEmpty()
+            if (tls != null && sni.isEmpty()) tls.put("serverName", host)
+            // Host — ТОЛЬКО если ни Host, ни SNI не заданы: тогда Xray взял бы
+            // им адрес, а это теперь IP. При заданном SNI Xray сам берёт Host
+            // из него — и так и надо. 10.11.2026: здесь подставлялся адрес, и у
+            // нод Sirius (адрес api.ferrin.uk, SNI a5c76b20.ferrin.uk) Host
+            // стал не тем: мелкие запросы проходили, «канал живой», а загрузка
+            // стояла намертво — 2 МБ за 25 с: 0 байт (INCY на той же ноде — 646 КБ/с).
+            if (sni.isEmpty()) for (k in listOf("wsSettings", "httpupgradeSettings", "xhttpSettings", "splithttpSettings")) {
+                val t = ss?.optJSONObject(k) ?: continue
+                val hdr = t.optJSONObject("headers")?.optString("Host").orEmpty()
+                if (t.optString("host").isEmpty() && hdr.isEmpty()) t.put("host", host)
+            }
+            spot.put("address", ip)
+        }
+        when {
+            hosts.isEmpty() -> {}
+            hosts.size == 1 -> ips[hosts[0]]?.let { onLog("🔎 ${hosts[0]} → $it") }
+                ?: onLog("⚠️ Не удалось разрешить ${hosts[0]} — Xray попробует сам")
+            else -> onLog("🔎 Адреса серверов группы шифрованным DNS: ${ips.values.count { it != null }} из ${hosts.size}" +
+                ips.filterValues { it == null }.keys.take(3).let { if (it.isEmpty()) "" else " (не нашлись: ${it.joinToString()})" })
+        }
+        if (ips.values.any { it != null }) obj.toString() else configJson
     } catch (t: Throwable) { configJson }
 
     // Нода за Cloudflare — отпечаток без постквантового ключа (см.
@@ -443,8 +519,121 @@ object XrayEngine {
                 .put(JSONObject().put("tag", "direct").put("protocol", "freedom")))
     }
 
+    // КОНФИГ ПРОВАЙДЕРА ЦЕЛИКОМ — нода-группа (см. Node.raw).
+    //
+    // 09.11.2026: «АВТО ВЫБОР» Пантеры — 13 серверов с балансировщиком, а мы
+    // брали первый (103.76.130.95:445). Tele2 его придушил — и две минуты
+    // ни одного соединения, хотя двенадцать запасных были живы. INCY запускает
+    // такой конфиг как есть, Xray сам меряет серверы и уходит с зависшего.
+    //
+    // Берём как есть выходы, маршруты с балансировщиком, обсерваторию,
+    // политики. Меняем только то, что обязано быть нашим:
+    //  - входы: один наш SOCKS (порт и пароль проставит withSocks); правила,
+    //    ссылавшиеся на входы провайдера, перевешиваем на него;
+    //  - api/stats/metrics/reverse/fakedns — служебные порты провайдера;
+    //  - geoip:/geosite:/ext: — файлов .dat у нас нет, и Xray с такой ссылкой
+    //    не стартует вовсе. Правило с гео-условием убираем ЦЕЛИКОМ: без этого
+    //    условия оно стало бы шире задуманного («всё — напрямую»). Российское
+    //    напрямую у нас и так решает sing-box до Xray;
+    //  - журнал — info: по нему CoreTrail считает дозвоны.
+    private val GEO_ITEM = Regex("^(geoip|geosite|ext|ext-ip|ext-domain):", RegexOption.IGNORE_CASE)
+    private val GEO_ANY = Regex("\"(geoip|geosite|ext|ext-ip|ext-domain):", RegexOption.IGNORE_CASE)
+
+    fun buildRaw(n: Node, armor: Boolean = false, fp: String = ""): JSONObject {
+        val root = JSONObject(n.raw)
+        if (armor) boostRaw(root, fp)
+        val oldIns = root.optJSONArray("inbounds")
+        val oldTags = (0 until (oldIns?.length() ?: 0))
+            .mapNotNull { oldIns?.optJSONObject(it)?.optString("tag")?.ifEmpty { null } }.toSet()
+        for (k in listOf("api", "stats", "metrics", "reverse", "fakedns", "remarks")) root.remove(k)
+        root.put("log", JSONObject().put("loglevel", "info"))
+        root.put("inbounds", JSONArray().put(JSONObject()
+            .put("tag", "socks-in").put("listen", "127.0.0.1").put("port", SOCKS_PORT)
+            .put("protocol", "socks")
+            .put("settings", JSONObject().put("udp", true).put("auth", "noauth"))))
+        root.optJSONObject("routing")?.optJSONArray("rules")?.let { rules ->
+            val kept = JSONArray()
+            rules@ for (i in 0 until rules.length()) {
+                val rule = rules.optJSONObject(i) ?: continue
+                if (rule.optString("outboundTag") == "api") continue
+                val tags = rule.optJSONArray("inboundTag")
+                if (tags != null) {
+                    val mapped = (0 until tags.length()).map { tags.optString(it) }
+                        .map { if (it in oldTags) "socks-in" else it }.distinct()
+                    if (mapped.isEmpty() || mapped.all { it == "api" }) continue@rules
+                    rule.put("inboundTag", JSONArray(mapped))
+                }
+                for (key in listOf("domain", "ip", "source")) {
+                    val a = rule.optJSONArray(key) ?: continue
+                    val left = (0 until a.length()).map { a.optString(it) }.filterNot { GEO_ITEM.containsMatchIn(it) }
+                    if (left.isEmpty()) continue@rules
+                    if (left.size < a.length()) rule.put(key, JSONArray(left))
+                }
+                kept.put(rule)
+            }
+            root.getJSONObject("routing").put("rules", kept)
+        }
+        // DNS провайдера с гео-ссылками Xray тоже не загрузит — без него.
+        root.optJSONObject("dns")?.let { if (GEO_ANY.containsMatchIn(it.toString())) root.remove("dns") }
+        return root
+    }
+
+    // Адреса серверов группы (до max) — для пинга: первый молчит, а группа
+    // жива, пока отвечает хоть один.
+    fun groupEndpoints(n: Node, max: Int = 4): List<Pair<String, Int>> = try {
+        val outs = JSONObject(n.raw).optJSONArray("outbounds")
+        val out = mutableListOf<Pair<String, Int>>()
+        for (i in 0 until (outs?.length() ?: 0)) {
+            val o = outs?.optJSONObject(i) ?: continue
+            if (o.optString("protocol") !in PROXY) continue
+            val s = o.optJSONObject("settings") ?: continue
+            val v = s.optJSONArray("vnext")?.optJSONObject(0) ?: s.optJSONArray("servers")?.optJSONObject(0) ?: s
+            val a = v.optString("address"); val p = v.optInt("port")
+            if (a.isNotEmpty() && p > 0 && (a to p) !in out) out += a to p
+            if (out.size >= max) break
+        }
+        out
+    } catch (_: Throwable) { emptyList() }
+
+    // БРОНЯ ДЛЯ ГРУППЫ ПРОВАЙДЕРА — то же, что для своих нод (см. buildConfig):
+    //  - тяжёлый отпечаток (chrome/firefox/safari — приветствие с
+    //    постквантовым ключом больше пакета) → наш лёгкий;
+    //  - нарезка приветствия через выход freedom, если у провайдера своей нет.
+    // Аварийные (белосписочные) группы сюда не попадают — им нужна похожесть
+    // на обычный сайт, а не нарезка.
+    private fun boostRaw(root: JSONObject, fp: String) {
+        val outs = root.optJSONArray("outbounds") ?: return
+        var needFrag = false
+        val tags = (0 until outs.length()).mapNotNull { outs.optJSONObject(it)?.optString("tag") }.toSet()
+        for (i in 0 until outs.length()) {
+            val o = outs.optJSONObject(i) ?: continue
+            if (o.optString("protocol") !in setOf("vless", "vmess", "trojan")) continue
+            val st = o.optJSONObject("streamSettings") ?: continue
+            for (k in listOf("realitySettings", "tlsSettings")) st.optJSONObject(k)?.let { s ->
+                s.put("fingerprint", xrayFp(s.optString("fingerprint"), reality = k == "realitySettings"))
+            }
+            val net = st.optString("network", "tcp").lowercase()
+            val sec = st.optString("security", "none").lowercase()
+            if (net in setOf("kcp", "mkcp", "quic") || sec == "none") continue
+            val so = st.optJSONObject("sockopt") ?: JSONObject().also { st.put("sockopt", it) }
+            if (fragOn && so.optString("dialerProxy").isEmpty()) { so.put("dialerProxy", FRAG_TAG); needFrag = true }
+        }
+        if (needFrag && FRAG_TAG !in tags) outs.put(JSONObject().put("tag", FRAG_TAG).put("protocol", "freedom")
+            .put("settings", JSONObject().put("fragment", JSONObject()
+                .put("packets", "tlshello").put("length", "100-200").put("interval", "10-20"))))
+    }
+
+    // Сколько серверов в группе — для журнала.
+    fun groupSize(n: Node): Int = try {
+        val outs = JSONObject(n.raw).optJSONArray("outbounds")
+        (0 until (outs?.length() ?: 0)).count { outs?.optJSONObject(it)?.optString("protocol") in PROXY }
+    } catch (_: Throwable) { 0 }
+
+    private val PROXY = setOf("vless", "vmess", "trojan", "shadowsocks", "hysteria", "hysteria2", "tuic")
+
     fun buildConfig(n: Node, armor: Boolean, fp: String, viaDpi: Boolean = false,
                     frontDomain: String = "", bait: List<String> = emptyList()): JSONObject {
+        if (n.raw.isNotEmpty()) return buildRaw(n, armor && !n.wl, fp)
         if (n.type == "Hysteria2") return buildHysteria2(n, armor, bait)
         // Режим белых списков: прикрываемся разрешённым доменом. Reality не
         // трогаем — там SNI связан с настройкой сервера, подмена ломает связь.
@@ -509,7 +698,7 @@ object XrayEngine {
 
         val sni = if (front) frontDomain
                   else n.sni.ifEmpty { if (n.host.isNotEmpty()) n.host else n.addr }
-        val useFp = if (armor && fp.isNotEmpty()) fp else n.fp.ifEmpty { "chrome" }
+        val useFp = xrayFp(if (armor && fp.isNotEmpty()) fp else n.fp, reality = n.pbk.isNotEmpty())
         when {
             n.pbk.isNotEmpty() -> {
                 stream.put("security", "reality")
@@ -561,7 +750,8 @@ object XrayEngine {
         //
         // Через ByeDPI это НЕ включаем: он режет тот же пакет по-своему, и
         // две нарезки поверх друг друга дают мусор, который сервер не соберёт.
-        val sockopt = JSONObject()
+        // Keepalive до сервера — как у sing-box (см. ConfigBuilder): 30 с / 15 с.
+        val sockopt = JSONObject().put("tcpKeepAliveIdle", 30).put("tcpKeepAliveInterval", 15)
         if (viaDpi) {
             // Цепочка через ByeDPI: фрагментация ClientHello до того, как пакет
             // увидит оператор. dialerProxy — штатный способ Xray сцепить outbound'ы.
@@ -581,18 +771,22 @@ object XrayEngine {
             // Проверено на живой сети 14.08.2026: с обфускацией обходная нода
             // поднималась, но трафик через неё не шёл совсем.
 
-            // Нарезка приветствия: первые пакеты, по 10-20 байт, с паузой.
-            sockopt.put("fragment", JSONObject()
-                .put("packets", "tlshello")
-                .put("length", "10-20")
-                .put("interval", "10-20"))
-            // Шум перед рукопожатием. Схема V2 — массив описаний,
-            // ровно как у Happ.
-            sockopt.put("noises", JSONArray()
-                .put(JSONObject().put("type", "rand")
-                    .put("packet", "10-20").put("delay", "10-16"))
-                .put(JSONObject().put("type", "rand")
-                    .put("packet", "8-16").put("delay", "5-10")))
+            // НАРЕЗКА ПРИВЕТСТВИЯ — ЧЕРЕЗ ВЫХОД freedom, А НЕ В sockopt.
+            //
+            // До 3.7.7 здесь стояло sockopt.fragment/noises. Таких полей в
+            // sockopt у Xray НЕТ — он их молча пропускал, и «броня» для VLESS
+            // и Reality не резала ничего (журнал при этом писал «броня вкл»).
+            // Проверено 09.11.2026 на Xray 26.10.10: со старым конфигом
+            // ClientHello приходил на сервер одним куском 1721 байт, с
+            // выходом freedom + dialerProxy — двенадцатью по 114–180 байт с
+            // паузами 10–20 мс. Так же устроено у Happ и INCY, их
+            // умолчание — 100–200 байт, 10–20 мс.
+            //
+            // 1721 байт — это chrome-приветствие с постквантовым ключом: оно
+            // не влезает в один TCP-пакет, и ТСПУ на таких спотыкается
+            // (Reality-ноды Триллера и Пантеры 09.11: линия чистая, а Xray из
+            // 25–48 дозвонов открывал 3).
+            if (fragOn) sockopt.put("dialerProxy", FRAG_TAG)
         }
         if (sockopt.length() > 0) stream.put("sockopt", sockopt)
 
@@ -629,7 +823,9 @@ object XrayEngine {
         //    ПО УСТРОЙСТВУ: он работает с исходным потоком TLS, а mux этот
         //    поток заворачивает в свой. Проверено на живой ноде: туннель
         //    поднимался и тут же падал, а выглядело это как «нода умерла».
-        if (armor && stream.getString("network") != "xhttp" && n.flow.isEmpty()) {
+        // 10.11.2026: mux — по переключателю (Prefs.muxOn, по умолчанию выкл.):
+        // восемь потоков в одном TCP — придушат его, и встанет всё сразу.
+        if (muxOn && armor && stream.getString("network") != "xhttp" && n.flow.isEmpty()) {
             proxy.put("mux", JSONObject()
                 .put("enabled", true)
                 .put("concurrency", 8)
@@ -649,6 +845,19 @@ object XrayEngine {
             .put("tag", "dpi").put("protocol", "socks")
             .put("settings", JSONObject().put("servers", JSONArray().put(
                 JSONObject().put("address", "127.0.0.1").put("port", ByeDpi.PORT)))))
+        // Нарезчик — только если прокси на него сослался (броня, не аварийная
+        // нода, не через ByeDPI). Умолчания как у INCY/Happ: приветствие
+        // кусками по 100–200 байт с паузой 10–20 мс. Шумы freedom касаются
+        // только UDP — пусть будут и для xudp.
+        if (stream.optJSONObject("sockopt")?.optString("dialerProxy") == FRAG_TAG)
+            outbounds.put(JSONObject().put("tag", FRAG_TAG).put("protocol", "freedom")
+                .put("settings", JSONObject()
+                    .put("fragment", JSONObject()
+                        .put("packets", "tlshello").put("length", "100-200").put("interval", "10-20"))
+                    .put("noises", JSONArray()
+                        .put(JSONObject().put("type", "rand").put("packet", "10-20").put("delay", "10-16"))))
+                .put("streamSettings", JSONObject().put("sockopt", JSONObject()
+                    .put("tcpKeepAliveIdle", 30).put("tcpKeepAliveInterval", 15))))
 
         return JSONObject()
             // info, а не warning: на warning ядро молчит о том, ПОЧЕМУ не идёт

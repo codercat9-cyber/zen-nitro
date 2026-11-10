@@ -66,10 +66,9 @@ object RadioKeeper {
     // Один DNS-запрос «ya.ru A» мимо туннеля. Ответ ждём недолго: важен
     // сам обмен — он и держит модем в рабочем состоянии.
     private fun poke() {
-        val net = Resolver.physical() ?: return
+        Resolver.physical() ?: return
         try {
-            java.net.DatagramSocket().use { s ->
-                net.bindSocket(s)
+            Bypass.datagram().use { s ->
                 s.soTimeout = 1500
                 val q = query()
                 s.send(java.net.DatagramPacket(q, q.size, TARGET))

@@ -28,6 +28,13 @@ object NodeConfig {
     fun prefersXray(ctx: Context, prefs: Prefs, n: Node): Boolean {
         if (!XrayEngine.available(ctx)) return false
         if (XrayEngine.handles(n)) return true
+        // VLESS — ПО УМОЛЧАНИЮ ЧЕРЕЗ XRAY, как у INCY и Happ. Панели
+        // настраивают серверы под Xray: 09.11 Пантера отвечала sing-box
+        // «reality verification failed», Xray проходил; 04.11 каскады
+        // Триллера на sing-box висли, Xray поднимал за секунды; 18.10 так же
+        // Sirius. sing-box остаётся вторым ядром — и первым для нод, что
+        // встают только на нём (Prefs.singboxNodes).
+        if (n.type == "VLESS" && XrayEngine.bothPossible(n) && traitKey(n) !in prefs.singboxNodes()) return true
         return XrayEngine.bothPossible(n) &&
             (traitKey(n) in prefs.xrayNodes() || xrayNeighbours(prefs, n) >= 2)
     }
@@ -52,6 +59,7 @@ object NodeConfig {
     // Конфиг ноды по текущим настройкам: (sing-box, Xray или "").
     // То же, что собирает плитка и обычное подключение без откатов.
     fun build(ctx: Context, prefs: Prefs, n: Node): Pair<String, String> {
+        prefs.applyTuning()
         val dpiOn = prefs.dpiEnabled
         val viaXray = prefersXray(ctx, prefs, n)
         val fp = if (prefs.armor) ConfigBuilder.pickFingerprint() else ""
@@ -98,7 +106,7 @@ object NodeConfig {
         val ip = Resolver.resolve(n.addr) ?: return false
         if (n.quic()) return true
         return try {
-            (Resolver.physical()?.socketFactory?.createSocket() ?: java.net.Socket()).use {
+            Bypass.socket().use {
                 it.connect(java.net.InetSocketAddress(ip, n.port), timeoutMs)
             }
             true
@@ -119,7 +127,11 @@ object NodeConfig {
                 (!prefs.whitelistMode || n.wl)
         }
         return cand.sortedWith(
-            compareBy<Node> { if (deadEntry != null && it.addr == deadEntry) 1 else 0 }
+            // Аварийные (белый список) — последними, если режим белых списков
+            // не включён: 09.11 сторож ушёл с «Каскад USA» на «Обход-6/3»
+            // (XHTTP через CDN) — на обычной сети они хуже любой обычной ноды.
+            compareBy<Node> { if (!prefs.whitelistMode && it.wl) 1 else 0 }
+                .thenBy { if (deadEntry != null && it.addr == deadEntry) 1 else 0 }
                 .thenBy { if (pdp && it.quic()) 1 else 0 }
                 .thenBy { if ((losses[traitKey(it)] ?: 0) >= 3) 1 else 0 }
                 .thenByDescending { wins[traitKey(it)] ?: 0L }
