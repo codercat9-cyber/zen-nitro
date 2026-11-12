@@ -46,6 +46,9 @@ class ZenVpnService : VpnService(), PlatformInterface {
         const val ACTION_STOP = "com.zen.blaster.STOP"
         // Пометить момент в журнале отладки — кнопкой из шторки.
         const val ACTION_MARK = "com.zen.blaster.MARK"
+        // Разбор соединений по команде терминала (flow) — то же, что сторож
+        // делает сам, когда канал молчит.
+        const val ACTION_FLOW = "com.zen.blaster.FLOW"
         const val EXTRA_CONFIG = "config"
         const val EXTRA_DPI = "dpi"            // включать ли ByeDPI
         const val EXTRA_DPI_STRATEGY = "dpiStrategy"
@@ -331,6 +334,13 @@ class ZenVpnService : VpnService(), PlatformInterface {
         com.zen.blaster.core.Blackbox.init(this)
         com.zen.blaster.core.Prefs(this).applyTuning()
         if (intent?.action == ACTION_STOP) { stopVpn(); return START_NOT_STICKY }
+        if (intent?.action == ACTION_FLOW) {
+            if (running && statsRunning) kotlin.concurrent.thread(name = "zen-flow", isDaemon = true) {
+                flowDump(null, statsTag, "по команде терминала", live = true)
+            } else say("🧪 flow: туннель не поднят — разбирать нечего")
+            if (!running) { stopSelf(); return START_NOT_STICKY }
+            return START_STICKY
+        }
         if (intent?.action == ACTION_MARK) {
             // Метка ставится вместе с обстановкой: что за нода, что с каналом,
             // какая сеть. Через сутки «тут отвалилось» без этого не разобрать.
@@ -405,6 +415,7 @@ class ZenVpnService : VpnService(), PlatformInterface {
         realityRejectSaid = false
         refusal = ""
         refusedHits = 0
+        held = false
         channelProven = false
         starting.set(true)
         // Поколение поднимаем ПЕРВЫМ делом: с этой секунды любой поток прошлого
@@ -472,6 +483,7 @@ class ZenVpnService : VpnService(), PlatformInterface {
         // 185 «провалов», ни одной настоящей попытки.
         refusal = ""
         refusedHits = 0
+        held = false
         channelProven = false
         com.zen.blaster.core.CoreTrail.reset()
         lineTarget(config, xrayConfig).let { attemptHost = it?.host.orEmpty(); attemptPort = it?.port ?: -1 }
@@ -583,6 +595,19 @@ class ZenVpnService : VpnService(), PlatformInterface {
                 // не объяснений. Продолжаем долбиться под капотом; kill switch
                 // всё это время держит трафик закрытым.
                 if (everUp) {
+                    // Без «переходить на другие ноды» — держим, что подняли
+                    // (как INCY): ядро и TUN живы, сторож следит за каналом и
+                    // скажет «Подключено», когда ответит. Раньше здесь был
+                    // новый круг переподъёма — и на глушёной сети они шли
+                    // друг за другом, каждый обрывая всё живое.
+                    if (!com.zen.blaster.core.Prefs(this).autoSwitchNode) {
+                        say("⚠️ Канал пока молчит — туннель поднят, держу его и жду")
+                        held = true
+                        Stats.stage.value = "Канал молчит — держу туннель"
+                        startStats(tag)
+                        updateNotif(null)
+                        return
+                    }
                     say("⚠️ Канал не отозвался — держу туннель и пробую снова")
                     reconnect()
                     return
@@ -814,6 +839,7 @@ class ZenVpnService : VpnService(), PlatformInterface {
         reconnects = 0
         // Человек отключился сам — со следующего запуска отсчёт с чистого листа.
         everUp = false
+        held = false; silenceSince = 0L
         lastNotifKey = ""
         // Снимаем авто-сброс DNS при смене сети: без туннеля он ни к чему.
         com.zen.blaster.core.DnsCacheManager.stopWatching(this)
@@ -873,6 +899,7 @@ class ZenVpnService : VpnService(), PlatformInterface {
     // цифра честная (наше приложение исключено из TUN и мерило бы прямой канал).
     private fun startStats(proxyTag: String) {
         if (statsRunning) return
+        statsTag = proxyTag
         statsRunning = true
         val sg = statsGen.incrementAndGet()
         txSnap = -1L; rxSnap = -1L; seenAt.clear()
@@ -980,6 +1007,16 @@ class ZenVpnService : VpnService(), PlatformInterface {
                 // набирал пять промахов и рвал живой туннель.
                 val pat = com.zen.blaster.core.NetInfo.patience(this)
                 val budget = 5000 * pat                    // 5 / 10 / 20 секунд
+                // Xray умер сам (вылет, система прибила процесс) — поднимаем
+                // его на том же порту сразу, не дожидаясь промахов: туннель и
+                // sing-box живы, им нужен только он.
+                xrayConfig?.let { xc ->
+                    if (running && !XrayEngine.running && !XrayEngine.respawning) {
+                        say("♻️ Процесс Xray завершился — поднимаю его заново, туннель не трогаю")
+                        com.zen.blaster.core.Blackbox.note("♻️ Xray умер под туннелем — перезапуск на порту ${XrayEngine.port}")
+                        XrayEngine.respawn(this, xc) { m -> sayCore(m) }
+                    }
+                }
                 // ЛУЧШИЙ ИЗ ДВУХ.
                 //
                 // Приём подсмотрен у Happ (у него это отдельный режим пинга
@@ -1000,6 +1037,8 @@ class ZenVpnService : VpnService(), PlatformInterface {
                     // связи, и за ними терялись настоящие провалы.
                     if (misses >= 2) say("✅ Канал восстановился после $misses промахов")
                     misses = 0
+                    silenceSince = 0L
+                    heldAlive()
                     // Пинг через туннель вдруг втрое хуже обычного — похоже, сота
                     // сбросила на медленную полосу. Встряхиваем радио (keepmts).
                     val best = Stats.shownPing.value
@@ -1024,6 +1063,8 @@ class ZenVpnService : VpnService(), PlatformInterface {
                         trafficLogged = true
                     }
                     misses = 0
+                    silenceSince = 0L
+                    heldAlive()
                     clearWaitStage()
                     noNetLogged = false
                 } else if (statsRunning) {
@@ -1108,7 +1149,41 @@ class ZenVpnService : VpnService(), PlatformInterface {
                         // переподключает каждое новое соединение; рвём только
                         // по-настоящему мёртвое — 2–3 минуты тишины.
                         val holdMs = (60_000L * pat).coerceIn(120_000L, 180_000L)
-                        if (misses >= 3 && System.currentTimeMillis() - missSince >= holdMs) {
+                        // ДЕРЖАТЬ, А НЕ РВАТЬ — как INCY (разбор его службы 12.11.2026).
+                        //
+                        // У INCY нет сторожа «канал молчит → переподнять»: поднятый
+                        // туннель он не трогает, пока не сменится сама сеть. Глушат —
+                        // соединения висят и сами оживают, как только отпустит. Мы
+                        // же рвали туннель через 2–3 мин тишины, а переподъём на
+                        // глушёной сети не проходил проверку и рвал снова: журнал
+                        // 10–12.11 — 13 срывов и по 2–35 попыток на каждый, до
+                        // трёх часов без связи (12.11 08:37 → 11:39).
+                        //
+                        // Теперь без «переходить на другие ноды» туннель держим
+                        // всегда. Раз в окно тишины — мягкая встряска: сброс
+                        // соединений ядра и перезапуск одного Xray на том же порту
+                        // (он заново спросит адрес сервера). Полный переподъём —
+                        // не чаще раза в 10 минут и только при живой сети.
+                        if (!com.zen.blaster.core.Prefs(this).autoSwitchNode && misses >= 3 &&
+                                System.currentTimeMillis() - missSince >= holdMs) {
+                            val silent = (System.currentTimeMillis() - missSince) / 1000
+                            softRecover("канал молчит $silent с при живой сети")
+                            missSince = System.currentTimeMillis()
+                            if (silenceSince == 0L) silenceSince = System.currentTimeMillis() - silent * 1000
+                            val longDead = System.currentTimeMillis() - silenceSince >= 10 * 60_000L &&
+                                android.os.SystemClock.elapsedRealtime() - lastFullRebuild >= 10 * 60_000L
+                            if (longDead) {
+                                lastFullRebuild = android.os.SystemClock.elapsedRealtime()
+                                say("⚠️ Канал молчит больше 10 минут — переподнимаю туннель целиком (раз в 10 мин)")
+                                com.zen.blaster.core.Blackbox.note(
+                                    "💔 «${Stats.server.value}» (${Stats.mode.value}) молчит " +
+                                    "${(System.currentTimeMillis() - silenceSince) / 1000} с — полный переподъём · " +
+                                    com.zen.blaster.core.NetInfo.line(this))
+                                misses = 0
+                                reconnect()
+                                return@Thread
+                            }
+                        } else if (misses >= 3 && System.currentTimeMillis() - missSince >= holdMs) {
                             say("⚠️ Канал не отвечает при живой сети — переподключаюсь")
                             com.zen.blaster.core.Blackbox.note(
                                 "💔 «${Stats.server.value}» (${Stats.mode.value}) сорвалась " +
@@ -1225,7 +1300,9 @@ class ZenVpnService : VpnService(), PlatformInterface {
     }
 
     // Разбор по соединениям — в журнал. Без запроса к ядру, если снимок есть.
-    private fun flowDump(o: org.json.JSONObject?, tag: String, why: String) {
+    // live — ещё и в живой журнал приложения (по команде терминала flow);
+    // сторож пишет только в файл, чтобы не засыпать экран.
+    private fun flowDump(o: org.json.JSONObject?, tag: String, why: String, live: Boolean = false) {
         try {
             val snap = o ?: org.json.JSONObject(http.newCall(com.zen.blaster.core.ClashApi.req("/connections").build())
                 .execute().use { it.body?.string().orEmpty() })
@@ -1242,7 +1319,7 @@ class ZenVpnService : VpnService(), PlatformInterface {
             val silent = mine.filter { it.up > 0 && it.down == 0L }
             val talking = mine.filter { it.down > 0 }
             fun kb(b: Long) = if (b < 1024) "$b Б" else if (b < 1_048_576) "%.1f КБ".format(b / 1024.0) else "%.1f МБ".format(b / 1_048_576.0)
-            val B = com.zen.blaster.core.Blackbox
+            val B = object { fun note(s: String) { com.zen.blaster.core.Blackbox.note(s); if (live) onLog?.invoke(s) } }
             B.note("🧪 $why — разбор соединений через «${Stats.server.value}» · " +
                 com.zen.blaster.core.NetInfo.line(this))
             B.note("   всего соединений $all, через прокси ${mine.size}: отдали ${kb(mine.sumOf { it.up })}, " +
@@ -1312,6 +1389,50 @@ class ZenVpnService : VpnService(), PlatformInterface {
     // по его команде. Раньше клиент сдавался сам: не уложился в проверку за
     // 20 секунд или исчерпал пять попыток — и туннель падал вместе с защитой.
     @Volatile private var everUp = false
+
+    // ------------------------------------------------- держать, а не рвать
+    //
+    // silenceSince — с какого момента канал молчит без перерыва (0 — говорит);
+    // lastFullRebuild — когда последний раз переподнимали туннель целиком;
+    // held — туннель поднят, но проверку канала не прошёл, и мы его ДЕРЖИМ:
+    // сторож объявит «Подключено», как только канал ответит.
+    @Volatile private var silenceSince = 0L
+    @Volatile private var lastFullRebuild = 0L
+    @Volatile private var held = false
+    // Выход туннеля, через который считаем трафик (proxy или dpi-socks).
+    @Volatile private var statsTag = "proxy"
+
+    // Мягкая встряска: туннель и TUN остаются, приложения ничего не теряют.
+    private fun softRecover(why: String) {
+        boxService?.resetNetwork()
+        com.zen.blaster.core.Resolver.forgetAll()
+        val xc = xrayConfig
+        val xr = if (xc != null && running) XrayEngine.respawn(this, xc) { m -> sayCore(m) } else null
+        say("🫸 ${why.replaceFirstChar { it.uppercase() }} — туннель не рву: сбросил соединения ядра" +
+            when (xr) {
+                true -> ", Xray перезапустил на том же порту"
+                false -> ", Xray не поднялся: ${XrayEngine.lastError}"
+                null -> ""
+            })
+        com.zen.blaster.core.Blackbox.note("🫸 мягкая встряска вместо обрыва: $why" +
+            (if (xr != null) " · Xray ${if (xr) "перезапущен" else "не поднялся"}" else "") +
+            " · " + com.zen.blaster.core.NetInfo.line(this))
+    }
+
+    // Удержанный туннель ожил — теперь он «Подключено» по-честному.
+    private fun heldAlive() {
+        if (!held) return
+        held = false
+        up = true
+        reconnects = 0; certStreak = 0
+        failSince = 0L; failedNodes.clear(); hops = 0; lastRefused = false
+        Stats.stage.value = ""
+        onState?.invoke(true)
+        say("✅ Канал ожил — туннель держали, не рвали")
+        com.zen.blaster.core.Blackbox.note("✅ «${Stats.server.value}» ожила на удержанном туннеле · " +
+            com.zen.blaster.core.NetInfo.line(this))
+        updateNotif(null)
+    }
 
     // ------------------------------------------------------------ kill switch
     //

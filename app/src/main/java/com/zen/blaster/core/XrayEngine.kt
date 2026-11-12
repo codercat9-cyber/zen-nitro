@@ -234,14 +234,36 @@ object XrayEngine {
         return try { startOnce(ctx, configJson, onLog) } finally { forceBuiltin = false }
     }
 
-    private fun startOnce(ctx: Context, configJson: String, onLog: (String) -> Unit): Boolean {
+    // ПЕРЕЗАПУСК ОДНОГО XRAY — ТУННЕЛЬ НЕ ТРОГАЕМ.
+    //
+    // Тот же порт, тот же логин и то же ядро (модуль или встроенное), что
+    // были: sing-box и TUN продолжают работать и снова находят Xray, как
+    // только он встал. Заодно Xray заново спрашивает адрес сервера по DoH —
+    // если провайдер сменил IP (10.11.2026, «AI🤖»: 50.7.87.251 умер, имя уже
+    // отдавало другие), он уходит на новый. Так INCY держит соединение:
+    // работающий туннель не рвут, чинят то, что под ним.
+    @Volatile var respawning = false; private set
+
+    @Synchronized
+    fun respawn(ctx: Context, configJson: String, onLog: (String) -> Unit): Boolean {
+        val builtin = !moduleInUse
+        forceBuiltin = builtin
+        respawning = true
+        return try { startOnce(ctx, configJson, onLog, keepPort = true) }
+               finally { forceBuiltin = false; respawning = false }
+    }
+
+    private fun startOnce(ctx: Context, configJson: String, onLog: (String) -> Unit,
+                          keepPort: Boolean = false): Boolean {
         stop()
         val orphans = reapOrphans()
-        if (orphans > 0) onLog("♻️ Погасил брошенный Xray от прошлого запуска ($orphans)")
+        if (orphans > 0 && !keepPort) onLog("♻️ Погасил брошенный Xray от прошлого запуска ($orphans)")
         val (cmd, fromModule) = command(ctx)
         moduleInUse = fromModule
         if (!fromModule && !binary(ctx).canExecute()) { lastError = "бинарник Xray не найден/не исполняемый"; return false }
-        claim()
+        // Порт только что отпущен убитым процессом — ждём, пока освободится.
+        if (keepPort) { for (i in 1..15) { if (ClashApi.free(port)) break; Thread.sleep(200) } }
+        else claim()
         return try {
             val cfg = File(ctx.filesDir, "xray_config.json")
             cfg.writeText(withSocks(retargetDpi(cloudflareSafe(resolveServer(configJson, onLog), onLog))))
@@ -633,7 +655,7 @@ object XrayEngine {
 
     fun buildConfig(n: Node, armor: Boolean, fp: String, viaDpi: Boolean = false,
                     frontDomain: String = "", bait: List<String> = emptyList()): JSONObject {
-        if (n.raw.isNotEmpty()) return buildRaw(n, armor && !n.wl, fp)
+        if (n.raw.isNotEmpty()) return buildRaw(n, armor && !n.wlLike(), fp)
         if (n.type == "Hysteria2") return buildHysteria2(n, armor, bait)
         // Режим белых списков: прикрываемся разрешённым доменом. Reality не
         // трогаем — там SNI связан с настройкой сервера, подмена ломает связь.
@@ -712,7 +734,11 @@ object XrayEngine {
                 if (n.wl) {
                     // Аварийный профиль: скучный распространённый отпечаток и
                     // обычный TLS вместо QUIC — h3 в такие моменты режут первым.
-                    t.put("fingerprint", "chrome")
+                    // Chrome — но 120-й, лёгкий: нынешний с постквантовым
+                    // ключом весит 1,8 КБ и не влезает в один пакет, а Chrome
+                    // ещё и тасует расширения — имя может уехать во второй
+                    // кусок, где ТСПУ белых списков его уже не ищет.
+                    t.put("fingerprint", xrayFp("chrome", reality = false))
                     t.put("alpn", JSONArray().put("h2").put("http/1.1"))
                 }
                 // allowInsecure в Xray 26 УДАЛЁН: ядро отвергает такой конфиг
@@ -756,7 +782,7 @@ object XrayEngine {
             // Цепочка через ByeDPI: фрагментация ClientHello до того, как пакет
             // увидит оператор. dialerProxy — штатный способ Xray сцепить outbound'ы.
             sockopt.put("dialerProxy", "dpi")
-        } else if (armor && !n.wl) {
+        } else if (armor && !n.wlLike()) {
             // АВАРИЙНЫЕ НОДЫ (n.wl) ОБФУСКАЦИЮ НЕ ПОЛУЧАЮТ — и это не
             // упущение, а то же правило, по которому мы не пускаем их через
             // ByeDPI.
@@ -770,6 +796,10 @@ object XrayEngine {
             //
             // Проверено на живой сети 14.08.2026: с обфускацией обходная нода
             // поднималась, но трафик через неё не шёл совсем.
+            //
+            // С 3.7.9 правило шире флага wl (см. Node.wlLike): белосписочные
+            // ноды из подписок и всё с российским SNI идут целым приветствием.
+            // 11.11.2026 так же «поднимались, но не ехали» Белые списки Sirius.
 
             // НАРЕЗКА ПРИВЕТСТВИЯ — ЧЕРЕЗ ВЫХОД freedom, А НЕ В sockopt.
             //

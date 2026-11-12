@@ -18,6 +18,24 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Hub
+import androidx.compose.material.icons.outlined.CloudSync
+import androidx.compose.material.icons.outlined.AddLink
+import androidx.compose.material.icons.outlined.Layers
+import androidx.compose.material.icons.outlined.FilterAlt
+import androidx.compose.material.icons.outlined.Speed
+import androidx.compose.material.icons.outlined.VerifiedUser
+import androidx.compose.material.icons.outlined.Policy
+import androidx.compose.material.icons.outlined.Router
+import androidx.compose.material.icons.outlined.Computer
+import androidx.compose.material.icons.outlined.Dns
+import androidx.compose.material.icons.outlined.Storage
+import androidx.compose.material.icons.outlined.Security
+import androidx.compose.material.icons.outlined.Block
+import androidx.compose.material.icons.outlined.Palette
+import androidx.compose.material.icons.outlined.SystemUpdate
+import androidx.compose.material.icons.outlined.Memory
+import androidx.compose.material.icons.outlined.Bolt
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.ArrowDownward
 import androidx.compose.material.icons.outlined.ArrowUpward
@@ -34,6 +52,8 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -42,6 +62,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.geometry.Offset
@@ -1191,7 +1212,7 @@ class MainActivity : ComponentActivity() {
         val pdp = com.zen.blaster.core.PdpGuard.lastVerdict.isNotEmpty()
         val now = System.currentTimeMillis()
         fun pool(skipTried: Boolean) = nodes.withIndex().filter { (_, n) ->
-            n.supported() && (!whitelist || n.wl) &&
+            n.supported() && (!whitelist || n.wlCapable()) &&
                 (!skipTried || traitKey(n) !in cascadeTried)
         }
         var cand = pool(true)
@@ -1641,7 +1662,7 @@ class MainActivity : ComponentActivity() {
             //
             // Наш список прикрытия (VK, Яндекс) — для нод, у которых своего
             // прикрытия НЕТ. У аварийных оно есть, и оно лучше нашего.
-            n?.wl == true -> ""
+            n?.wlLike() == true -> ""
             // Вторая попытка после отказа: идём к серверу с его собственным
             // именем. Подмена работает только там, где сервер согласен на
             // любое имя, а это редкость — см. сторож ниже.
@@ -1665,8 +1686,9 @@ class MainActivity : ComponentActivity() {
         when {
             n?.whitelistNative() == true ->
                 log("⚪ Нода уже маскируется под ${n.sni.ifEmpty { n.host }} — беру как есть")
-            n?.wl == true && front.isEmpty() ->
-                log("⚪ Аварийная нода: консервативный профиль, имя не подменяю")
+            n?.wlLike() == true && front.isEmpty() ->
+                log(if (n.wl) "⚪ Аварийная нода: консервативный профиль, имя не подменяю"
+                    else "⚪ Белосписочная нода: имя разрешённое — не подменяю и не режу приветствие")
             front.isEmpty() -> {}
             n?.frontable() != true ->
                 log("⚠️ ${n?.badge()}: имя подменить нельзя (Reality или без TLS) — иду как есть")
@@ -1687,7 +1709,7 @@ class MainActivity : ComponentActivity() {
             // приветствие, которое мы делаем похожим на обычный поход на сайт.
             // На стороне sing-box это уже так — приводим Xray к тому же.
             XrayEngine.buildConfig(n, prefs.armor, fp,
-                viaDpi = chainOn && !n.wl, frontDomain = front, bait = bait).toString()
+                viaDpi = chainOn && !n.wlLike(), frontDomain = front, bait = bait).toString()
         } else null
 
         val proxyMode = prefs.proxyMode
@@ -1712,19 +1734,20 @@ class MainActivity : ComponentActivity() {
         if (n?.type == "Hysteria2" && !hyViaXray) {
             val (bd, bu) = brutal()
             if (bd > 0) log("⚡ Hysteria2 в режиме Brutal: $bd↓ / $bu↑ Мбит/с")
-            else log("🌊 Hysteria2 на BBR — канал слишком узкий для заявленного темпа")
+            else log("🌊 Hysteria2 на BBR — сам найдёт потолок канала (оценка сотовой ненадёжна, Brutal зажал бы скорость)")
         }
         // У группы провайдера конфиг его — нашей брони там нет, и врать о ней незачем.
         // Журнал называет то, что реально уходит в провод: отпечаток (edge —
         // приветствие в один пакет) и нарезку приветствия у Xray (выход frag).
         if (prefs.armor) log(
             if (hyViaXray) "🛡 Броня: шум перед рукопожатием (как у Amnezia), IPv6 off"
-            else if (n?.raw?.isNotEmpty() == true && n?.wl != true) "🛡 Броня группы: отпечаток → ${com.zen.blaster.core.XrayEngine.LIGHT_FP} (Chrome 120 без постквантового ключа)" + (if (prefs.fragOn) ", нарезка приветствия по 100–200 Б" else "")
-            else if (n?.raw?.isNotEmpty() == true) "🛡 Аварийная группа — конфиг провайдера как есть"
+            else if (n?.raw?.isNotEmpty() == true && n?.wlLike() != true) "🛡 Броня группы: отпечаток → ${com.zen.blaster.core.XrayEngine.LIGHT_FP} (Chrome 120 без постквантового ключа)" + (if (prefs.fragOn) ", нарезка приветствия по 100–200 Б" else "")
+            else if (n?.raw?.isNotEmpty() == true) "🛡 Белосписочная группа — конфиг провайдера как есть, приветствие целиком"
             else "🛡 Броня: отпечаток ${if (viaXray) com.zen.blaster.core.XrayEngine.xrayFp(fp, n?.pbk?.isNotEmpty() == true) else ConfigBuilder.lastFingerprint}" +
                 (if (viaXray && dpiOn && prefs.chainVpnViaDpi) ", через ByeDPI"
-                 else if (viaXray && n?.wl != true && prefs.fragOn) ", нарезка приветствия по 100–200 Б" else "") +
-                (if (viaXray && prefs.muxOn) ", mux" else "") +
+                 else if (viaXray && n?.wlLike() != true && prefs.fragOn) ", нарезка приветствия по 100–200 Б"
+                 else if (viaXray && n?.wlLike() == true) ", приветствие целиком (имя разрешённое)" else "") +
+                (if (viaXray && prefs.muxOn && n?.flow.isNullOrEmpty() && n?.transport?.lowercase() !in setOf("xhttp", "splithttp")) ", mux" else "") +
                 ", IPv6 off" + (if (prefs.blockQuic && n?.quic() != true) ", QUIC → TCP" else "") +
                 if (dpiOn) ", фрагментация TLS (ByeDPI)" else "")
         // В режиме прокси системный VPN не поднимается — согласие не нужно.
@@ -1959,7 +1982,7 @@ class MainActivity : ComponentActivity() {
             log("🔎 Проверяю, что сегодня пропускает сеть…")
             val v = runCatching { com.zen.blaster.core.WhitelistSniff.probe() }.getOrNull()
             if (v == null) { log("… проверку сети выполнить не удалось"); return@launch }
-            val wl = nodes.filter { it.wl }
+            val wl = nodes.filter { it.wlCapable() }
             // Вердикт кладём в журнал отдельной строкой и всегда, даже когда
             // человеку показывать нечего: «в тот вечер сеть пропускала всё» —
             // это ответ на вопрос, виновата нода или оператор.
@@ -1967,7 +1990,7 @@ class MainActivity : ComponentActivity() {
                 "🧾 опрос сети: разрешённые ${v.allowedOk}/3, заграничные ${v.neutralOk}/3 → " +
                 v.verdictText() + " · " + com.zen.blaster.core.NetInfo.line(this@MainActivity))
             val lines = com.zen.blaster.core.WhitelistSniff.explain(
-                v, wl.size, wl.count { it.frontable() })
+                v, wl.size, wl.count { it.frontable() || !it.wl }, wl.take(3).map { it.name })
             if (lines.isEmpty()) {
                 log("   Сеть пропускает и разрешённое, и заграничное " +
                     "(${v.allowedOk}/${v.neutralOk}) — дело в самой ноде, попробуйте другую.")
@@ -1997,7 +2020,12 @@ class MainActivity : ComponentActivity() {
                     com.zen.blaster.core.RadioKick.kick(this@MainActivity, "сеть молчит") { m -> runOnUiThread { log(m) } }
                     com.zen.blaster.core.Blackbox.note("↻ каскад: сеть не держит, пауза ${pause / 1000} с")
                     kotlinx.coroutines.delay(pause)
-                } else if (!prefs.autoSwitchNode) {
+                } else if (!prefs.autoSwitchNode && !(v.whitelist && wl.isNotEmpty() &&
+                        nodes.getOrNull(selected.intValue)?.wlCapable() != true)) {
+                    // Белые списки — исключение из «куда просили»: обычная нода
+                    // за границей в такой день не встанет ни с какой попытки
+                    // (11.11.2026: 106 попыток «ОБХОД № 3» за утро). Туда, где
+                    // есть шанс, — к белосписочной; сама нода в списке остаётся.
                     // Куда просили: та же нода, ядра она уже пробовала; ждём и
                     // повторяем, как INCY. На другую — только если включено.
                     cascadeIdle++
@@ -2014,7 +2042,8 @@ class MainActivity : ComponentActivity() {
                         val why = if (prefs.carrierWins(com.zen.blaster.core.NetInfo.carrierKey(this@MainActivity))
                                 .containsKey(traitKey(nn))) "она поднималась на этом операторе"
                             else if (nn.ping > 0) "пинг ${nn.ping} мс" else "следующая по списку"
-                        log("↪ «${cur?.name}» не встаёт при живой сети — перехожу на «${nn.name}» ($why)")
+                        val wlWhy = if (v.whitelist && cur?.wlCapable() != true) "белые списки, " else ""
+                        log("↪ «${cur?.name}» не встаёт при живой сети — перехожу на «${nn.name}» ($wlWhy$why)")
                         com.zen.blaster.core.Blackbox.note("↪ каскад: «${cur?.name}» → «${nn.name}» ($why)")
                         selected.intValue = next
                         prefs.selectedServer = next
@@ -3715,7 +3744,6 @@ class MainActivity : ComponentActivity() {
     // Выбор ядра и всё, что относится к режиму Amnezia.
     @Composable
     private fun EngineSection() {
-        Text("ЯДРО ТУННЕЛЯ", color = ZenRed, fontWeight = FontWeight.Bold)
         Row(Modifier.fillMaxWidth().padding(top = 6.dp)) {
             listOf(
                 0 to "sing-box + Xray",
@@ -3797,12 +3825,12 @@ class MainActivity : ComponentActivity() {
         val scroll = rememberScrollState()
         Column(Modifier.fillMaxSize().padding(20.dp).verticalScroll(scroll)) {
             Text("НАСТРОЙКИ", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold)
-            Spacer(Modifier.height(20.dp))
 
-            EngineSection()
-            Spacer(Modifier.height(20.dp))
+            SetGroup("ЯДРО")
+            SetCard(Icons.Outlined.Bolt, "Ядро туннеля", "sing-box + Xray или Amnezia", startOpen = true) { EngineSection() }
 
-            Text("ВЫБОР СЕРВЕРА", color = ZenRed, fontWeight = FontWeight.Bold)
+            SetGroup("СЕРВЕРЫ")
+            SetCard(Icons.Outlined.Hub, "Выбор сервера", "ноды по подпискам, нажми — выбрать") {
             // Тот же принцип, что и в нижнем списке: сперва подписка, под ней
             // её серверы. Иначе сотня нод сливается в кашу.
             nodes.withIndex()
@@ -3857,8 +3885,8 @@ class MainActivity : ComponentActivity() {
             }
 
             // ---------- ПОДПИСКИ И КОНФИГИ ----------
-            Spacer(Modifier.height(22.dp))
-            Text("ПОДПИСКИ И КОНФИГИ", color = ZenRed, fontWeight = FontWeight.Bold)
+            }
+            SetCard(Icons.Outlined.CloudSync, "Подписки и конфиги", "добавить, обновить, убрать") {
 
             var subs by remember { mutableStateOf(prefs.subscriptions()) }
             subs.forEachIndexed { i, s ->
@@ -3939,8 +3967,9 @@ class MainActivity : ComponentActivity() {
             Text("Поддерживаются подписки (http/https) и прямые конфиги. Можно вставить несколько строк.",
                 color = ZenGray, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp))
 
-            Spacer(Modifier.height(20.dp))
-            Text("РЕЖИМ РАБОТЫ", color = ZenRed, fontWeight = FontWeight.Bold)
+            }
+            SetGroup("ОБХОД БЛОКИРОВОК")
+            SetCard(Icons.Outlined.Layers, "Режим работы", "VPN, DPI-щит, прокси") {
             ToggleRow("VPN (сервер из списка, меняет IP)", prefs.vpnEnabled) { prefs.vpnEnabled = it }
             ToggleRow("DPI-щит ByeDPI (обход без VPN)", prefs.dpiEnabled) { prefs.dpiEnabled = it }
             Text(
@@ -3949,8 +3978,8 @@ class MainActivity : ComponentActivity() {
                 color = ZenGray, fontSize = 11.sp
             )
 
-            Spacer(Modifier.height(14.dp))
-            Text("СТРАТЕГИЯ ОБХОДА DPI", color = ZenRed, fontWeight = FontWeight.Bold)
+            }
+            SetCard(Icons.Outlined.FilterAlt, "Стратегия обхода DPI", "как ByeDPI режет пакеты") {
             var stratSel by remember { mutableIntStateOf(prefs.dpiStrategy) }
             com.zen.blaster.core.ByeDpi.STRATEGIES.forEachIndexed { i, s ->
                 Surface(color = if (i == stratSel) ZenCyan.copy(alpha = 0.22f) else ZenCard,
@@ -3963,8 +3992,8 @@ class MainActivity : ComponentActivity() {
             }
             Text("Не открывается сайт — смени стратегию.", color = ZenGray, fontSize = 11.sp)
 
-            Spacer(Modifier.height(20.dp))
-            Text("🛡 БРОНЯ ОТ ДЕТЕКТА (PDP)", color = ZenRed, fontWeight = FontWeight.Bold)
+            }
+            SetCard(Icons.Outlined.Shield, "Броня от детекта", "отпечаток, шум, ритм проверок") {
             ToggleRow("Маскировка туннеля под обычный HTTPS", prefs.armor) { prefs.armor = it }
             Text(
                 "Оператор ловит не VPN, а сам ФАКТ туннеля — и душит абонента. Броня прячет признаки:\n" +
@@ -3975,8 +4004,8 @@ class MainActivity : ComponentActivity() {
                 color = ZenGray, fontSize = 11.sp
             )
 
-            Spacer(Modifier.height(20.dp))
-            Text("ДОБАВИТЬ СЕРВЕР ССЫЛКОЙ", color = ZenRed, fontWeight = FontWeight.Bold)
+            }
+            SetCard(Icons.Outlined.AddLink, "Добавить сервер ссылкой", "vless://, hy2://, vpn:// и другие") {
             var link by remember { mutableStateOf("") }
             OutlinedTextField(
                 value = link, onValueChange = { link = it },
@@ -4044,8 +4073,8 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            Spacer(Modifier.height(20.dp))
-            Text("РАЗГОН HYSTERIA2", color = ZenRed, fontWeight = FontWeight.Bold)
+            }
+            SetCard(Icons.Outlined.Speed, "Разгон Hysteria2", "Brutal или BBR") {
             var boost by remember { mutableStateOf(prefs.hyBoost) }
             var hDown by remember { mutableStateOf(prefs.hyDownMbps.toString()) }
             var hUp by remember { mutableStateOf(prefs.hyUpMbps.toString()) }
@@ -4088,8 +4117,9 @@ class MainActivity : ComponentActivity() {
                 color = ZenGray, fontSize = 11.sp, modifier = Modifier.padding(top = 6.dp)
             )
 
-            Spacer(Modifier.height(20.dp))
-            Text("АВАРИЙНЫЕ СЕРВЕРЫ (БЕЛЫЙ СПИСОК)", color = ZenRed, fontWeight = FontWeight.Bold)
+            }
+            SetGroup("БЕЛЫЕ СПИСКИ")
+            SetCard(Icons.Outlined.VerifiedUser, "Аварийные серверы", "ноды на день белых списков") {
             Text(
                 "Отдельный арсенал: эти ноды идут первой группой в списке и получают " +
                 "собственный, максимально консервативный набор параметров — отпечаток chrome, " +
@@ -4157,8 +4187,8 @@ class MainActivity : ComponentActivity() {
                 )
             }
 
-            Spacer(Modifier.height(20.dp))
-            Text("ОБХОД БЕЛЫХ СПИСКОВ", color = ZenRed, fontWeight = FontWeight.Bold)
+            }
+            SetCard(Icons.Outlined.Policy, "Обход белых списков", "прикрытие разрешённым доменом") {
             var wl by remember { mutableStateOf(prefs.whitelistMode) }
             var wlDomain by remember { mutableStateOf(prefs.whitelistDomain) }
             ToggleRow("Прикрываться разрешённым доменом", wl) { wl = it; prefs.whitelistMode = it }
@@ -4208,8 +4238,9 @@ class MainActivity : ComponentActivity() {
                 color = ZenGray, fontSize = 11.sp, modifier = Modifier.padding(top = 6.dp)
             )
 
-            Spacer(Modifier.height(20.dp))
-            Text("КАК ИСПОЛЬЗОВАТЬ СЕРВЕР", color = ZenRed, fontWeight = FontWeight.Bold)
+            }
+            SetGroup("СЕТЬ")
+            SetCard(Icons.Outlined.Router, "Как использовать сервер", "VPN для всего телефона или прокси") {
             var proxy by remember { mutableStateOf(prefs.proxyMode) }
             Row(Modifier.fillMaxWidth().padding(top = 6.dp)) {
                 listOf(false to "VPN (весь телефон)", true to "Прокси (порт)").forEach { (v, label) ->
@@ -4243,8 +4274,8 @@ class MainActivity : ComponentActivity() {
             )
 
             // ---------- РАЗДАЧА НА КОМПЬЮТЕР ----------
-            Spacer(Modifier.height(20.dp))
-            Text("РАЗДАЧА НА КОМПЬЮТЕР", color = ZenRed, fontWeight = FontWeight.Bold)
+            }
+            SetCard(Icons.Outlined.Computer, "Раздача на компьютер", "прокси по Wi-Fi с паролем") {
             var lan by remember { mutableStateOf(prefs.lanProxy) }
             ToggleRow("Пускать в прокси из локальной сети", lan) {
                 lan = it
@@ -4305,8 +4336,8 @@ class MainActivity : ComponentActivity() {
             }
 
             // ---------- DNS ----------
-            Spacer(Modifier.height(20.dp))
-            Text("РЕЗОЛВЕР DNS", color = ZenRed, fontWeight = FontWeight.Bold)
+            }
+            SetCard(Icons.Outlined.Dns, "Резолвер DNS", "кто превращает имена сайтов в адреса") {
             var dnsSel by remember { mutableIntStateOf(prefs.dnsProvider) }
             var dnsOwn by remember { mutableStateOf(prefs.dnsCustom) }
 
@@ -4443,7 +4474,8 @@ class MainActivity : ComponentActivity() {
             // (Resolver), ядра (sing-box) и даёт системе намёк пересмотреть
             // свой. Кнопка для ручного, переключатель для автоматического.
             Spacer(Modifier.height(10.dp))
-            Text("DNS-КЕШ", color = ZenRed, fontWeight = FontWeight.Bold)
+            }
+            SetCard(Icons.Outlined.Storage, "DNS-кеш", "запомненные адреса") {
 
             // Индикатор здоровья DNS
             val dnsHealth = remember { mutableIntStateOf(com.zen.blaster.core.DnsCacheManager.healthStatus) }
@@ -4549,8 +4581,9 @@ class MainActivity : ComponentActivity() {
                 color = ZenGray, fontSize = 11.sp, modifier = Modifier.padding(top = 6.dp)
             )
 
-            Spacer(Modifier.height(20.dp))
-            Text("ЗАЩИТА И РОУТИНГ", color = ZenRed, fontWeight = FontWeight.Bold)
+            }
+            SetGroup("ЗАЩИТА")
+            SetCard(Icons.Outlined.Security, "Защита и роутинг", "обход РУ-приложений, утечки") {
 
             // ГДЕ МЫ ВЫШЛИ НА САМОМ ДЕЛЕ.
             //
@@ -4605,8 +4638,8 @@ class MainActivity : ComponentActivity() {
                 color = ZenGray, fontSize = 11.sp, modifier = Modifier.padding(top = 6.dp, bottom = 6.dp)
             )
 
-            Spacer(Modifier.height(14.dp))
-            Text("KILL SWITCH", color = ZenRed, fontWeight = FontWeight.Bold)
+            }
+            SetCard(Icons.Outlined.Block, "Kill switch", "нет туннеля — нет интернета") {
             ToggleRow("Рвать трафик, если туннель упал", prefs.killSwitch) { prefs.killSwitch = it }
             Text(
                 "Туннель может упасть сам: сервер отвалился, сеть моргнула, ядро умерло. " +
@@ -4639,10 +4672,12 @@ class MainActivity : ComponentActivity() {
                 prefs.autoSwitchNode = it }
             ToggleRow("Держать телефон бодрствующим, пока работает туннель (нужно на Xiaomi/HyperOS)",
                 prefs.holdAwake) { prefs.holdAwake = it }
-            TuningSection()
+            }
+            SetGroup("СОЕДИНЕНИЕ")
+            SetCard(Icons.Outlined.Tune, "Соединение · VLESS / Reality", "mux, нарезка, QUIC, отпечаток, стек TUN") { TuningSection() }
 
-            Spacer(Modifier.height(20.dp))
-            Text("ВНЕШНИЙ ВИД", color = ZenRed, fontWeight = FontWeight.Bold)
+            SetGroup("ПРИЛОЖЕНИЕ")
+            SetCard(Icons.Outlined.Palette, "Внешний вид", "надпись на главной") {
             Text(
                 "Надпись сверху настраивается: нажмите прямо на неё. Можно сменить " +
                 "шрифт (готика не обязательна), размер или вписать своё название.",
@@ -4655,8 +4690,8 @@ class MainActivity : ComponentActivity() {
             ) { Text("НАСТРОИТЬ НАДПИСЬ", color = Color.White, fontSize = 13.sp) }
 
             // ---------- ОБНОВЛЕНИЯ ----------
-            Spacer(Modifier.height(22.dp))
-            Text("ОБНОВЛЕНИЯ", color = ZenRed, fontWeight = FontWeight.Bold)
+            }
+            SetCard(Icons.Outlined.SystemUpdate, "Обновления", "новая версия Zen Nitro") {
             val upd = com.zen.blaster.core.Updater
             Text("Сейчас стоит ${upd.myName(this@MainActivity)} (сборка ${upd.myCode(this@MainActivity)})",
                 color = ZenGray, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp))
@@ -4694,9 +4729,9 @@ class MainActivity : ComponentActivity() {
                 color = ZenGray, fontSize = 11.sp, modifier = Modifier.padding(top = 6.dp)
             )
 
-            CoresSection()
+            }
+            SetCard(Icons.Outlined.Memory, "Ядра", "Xray, Amnezia, sing-box — версии и обновления") { CoresSection() }
 
-            Spacer(Modifier.height(20.dp))
             Text("ℹ️ Обход DPI на Android обеспечивают сами протоколы (Reality/Hysteria2+Salamander/Gecko). " +
                 "tpws/nfqws на Android недоступны.", color = ZenGray, fontSize = 11.sp)
         }
@@ -4764,8 +4799,6 @@ class MainActivity : ComponentActivity() {
             if (slot != cm.XRAY && !(prefs.awgRunning || prefs.awgLegacyRunning)) ZenAwgService.stopAll(ctx)
         }
 
-        Spacer(Modifier.height(22.dp))
-        Text("ЯДРА", color = ZenRed, fontWeight = FontWeight.Bold)
         key(tick) {
             Text(
                 line("Xray", cm.XRAY, builtinXray) + "\n" +
@@ -4864,26 +4897,91 @@ class MainActivity : ComponentActivity() {
         )
     }
 
+    // ------------------------------------------------- плитки настроек
+    //
+    // 12.11.2026, по скриншотам INCY: настройки — не простыня заголовков, а
+    // плитки. Слева значок в цветном квадрате, название и подпись, справа
+    // стрелка; нажал — плитка раскрылась. Над группами плиток — серые
+    // подписи. Что открыто, помним до выхода из приложения.
+    private val cardOpen = mutableStateMapOf<String, Boolean>()
+
     @Composable
-    private fun ToggleRow(label: String, initial: Boolean, onChange: (Boolean) -> Unit) {
-        var checked by remember { mutableStateOf(initial) }
-        Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text(label, color = Color.White, modifier = Modifier.weight(1f), fontSize = 13.sp)
-            Switch(checked = checked, onCheckedChange = { checked = it; onChange(it) })
+    private fun SetGroup(label: String) {
+        Text(label, color = ZenGray, fontSize = 11.sp, fontWeight = FontWeight.Bold,
+            letterSpacing = 1.sp, modifier = Modifier.padding(start = 4.dp, top = 18.dp, bottom = 6.dp))
+    }
+
+    @Composable
+    private fun SetCard(icon: androidx.compose.ui.graphics.vector.ImageVector, title: String, summary: String,
+                        tint: Color = ZenCyan, startOpen: Boolean = false,
+                        content: @Composable ColumnScope.() -> Unit) {
+        val open = cardOpen[title] ?: startOpen
+        val turn by androidx.compose.animation.core.animateFloatAsState(if (open) 180f else 0f, label = "chev")
+        Column(Modifier.fillMaxWidth().padding(bottom = 8.dp).clip(RoundedCornerShape(16.dp))
+            .background(ZenCard).border(1.dp, if (open) tint.copy(alpha = 0.35f) else ZenDivider,
+                RoundedCornerShape(16.dp))) {
+            Row(Modifier.fillMaxWidth().clickable { cardOpen[title] = !open }
+                .padding(horizontal = 12.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.size(36.dp).clip(RoundedCornerShape(10.dp)).background(tint.copy(alpha = 0.14f)),
+                    contentAlignment = Alignment.Center) {
+                    Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(20.dp))
+                }
+                Column(Modifier.weight(1f).padding(start = 12.dp)) {
+                    Text(title, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                    if (summary.isNotEmpty()) Text(summary, color = ZenGray, fontSize = 12.sp)
+                }
+                Icon(Icons.Outlined.KeyboardArrowDown, contentDescription = null, tint = ZenGray,
+                    modifier = Modifier.graphicsLayer { rotationZ = turn })
+            }
+            androidx.compose.animation.AnimatedVisibility(open) {
+                Column(Modifier.fillMaxWidth().padding(start = 14.dp, end = 14.dp, bottom = 14.dp)) {
+                    HorizontalDivider(color = ZenDivider, modifier = Modifier.padding(bottom = 10.dp))
+                    content()
+                }
+            }
         }
     }
 
-    // Выбор из нескольких значений: нажатие — следующее по кругу.
+    // Переключатель строкой, как у INCY: сверху название, под ним серым —
+    // пояснение. Старые подписи вида «Название — пояснение» делим по тире.
+    @Composable
+    private fun ToggleRow(label: String, initial: Boolean, onChange: (Boolean) -> Unit) {
+        var checked by remember { mutableStateOf(initial) }
+        val title = label.substringBefore(" — ")
+        val sub = if (label.contains(" — ")) label.substringAfter(" — ") else ""
+        Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+            .clickable { checked = !checked; onChange(checked) }.padding(vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f).padding(end = 10.dp)) {
+                Text(title, color = Color.White, fontSize = 14.sp)
+                if (sub.isNotEmpty()) Text(sub.replaceFirstChar { it.uppercase() }, color = ZenGray, fontSize = 12.sp)
+            }
+            Switch(checked = checked, onCheckedChange = { checked = it; onChange(it) },
+                colors = SwitchDefaults.colors(checkedThumbColor = Color.Black, checkedTrackColor = ZenCyan,
+                    uncheckedThumbColor = ZenGray, uncheckedTrackColor = Color(0xFF1C1D22),
+                    uncheckedBorderColor = ZenDivider))
+        }
+    }
+
+    // Выбор из нескольких значений — чипами, как «Память 40/60/80 МБ» у INCY:
+    // все варианты видны сразу, выбранный подсвечен.
     @Composable
     private fun ChoiceRow(label: String, options: List<Pair<String, String>>, initial: String,
                           onChange: (String) -> Unit) {
         var cur by remember { mutableStateOf(initial) }
-        val i = options.indexOfFirst { it.first == cur }.coerceAtLeast(0)
-        Row(Modifier.fillMaxWidth().padding(vertical = 6.dp).clickable {
-                cur = options[(i + 1) % options.size].first; onChange(cur)
-            }, verticalAlignment = Alignment.CenterVertically) {
-            Text(label, color = Color.White, modifier = Modifier.weight(1f), fontSize = 13.sp)
-            Text(options[i].second + "  ▸", color = ZenCyan, fontSize = 13.sp)
+        Column(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+            Text(label, color = Color.White, fontSize = 14.sp)
+            Row(Modifier.fillMaxWidth().padding(top = 6.dp).horizontalScroll(rememberScrollState())) {
+                options.forEach { (k, v) ->
+                    val on = k == cur
+                    Box(Modifier.padding(end = 6.dp).clip(RoundedCornerShape(10.dp))
+                        .background(if (on) ZenCyan.copy(alpha = 0.18f) else Color(0xFF1C1D22))
+                        .border(1.dp, if (on) ZenCyan else ZenDivider, RoundedCornerShape(10.dp))
+                        .clickable { cur = k; onChange(k) }.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                        Text(v, color = if (on) ZenCyan else Color.White, fontSize = 12.sp)
+                    }
+                }
+            }
         }
     }
 
@@ -4892,8 +4990,6 @@ class MainActivity : ComponentActivity() {
     // и с честным описанием. Применяется при следующем подключении.
     @Composable
     private fun TuningSection() {
-        Spacer(Modifier.height(20.dp))
-        Text("СОЕДИНЕНИЕ · VLESS / REALITY", color = ZenRed, fontWeight = FontWeight.Bold)
         Text("Применяется при следующем подключении. Умолчания — по замерам на телефоне.",
             color = ZenGray, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp))
         ToggleRow("Мультиплексирование (Mux) — несколько потоков в одном соединении. " +
@@ -4914,39 +5010,534 @@ class MainActivity : ComponentActivity() {
             color = ZenGray, fontSize = 11.sp, modifier = Modifier.padding(top = 2.dp))
     }
 
+    // ЖУРНАЛ И ТЕРМИНАЛ — две вкладки одного экрана.
+    //
+    // Журнал — как «Логи туннеля» у INCY, только наш: поиск, фильтр по виду
+    // строк, номера и цвет по смыслу, кнопки внизу. Терминал — отдельный
+    // экран со своим выводом: команды управления клиентом (см. runCli и
+    // helpzen). Вывод терминала в журнал не сыплется — туда идут только
+    // действия, которые что-то меняют («⌨️ терминал: …»), чтобы при разборе
+    // было видно, кто включил mux.
+    private val logTab = mutableStateOf("log")
+    private val logFilter = mutableStateOf("all")
+    private val logQuery = mutableStateOf("")
+    private val cliLines = mutableStateListOf<String>()
+    private val cliHistory = mutableListOf<String>()
+
+    private fun cliOut(s: String) {
+        cliLines.add(s); if (cliLines.size > 600) cliLines.removeAt(0)
+    }
+
+    private fun logKind(s: String): String = when {
+        s.contains("❌") || s.contains("✖") || s.contains("⛔") || s.contains("💔") ||
+            s.contains("ERROR") || s.contains("[Error]") -> "err"
+        s.contains("⚠️") || s.contains("[Warning]") -> "warn"
+        s.contains("🩺") || s.contains("🧪") || s.contains("#DIAG") || s.contains("#FLOW") ||
+            s.contains("🧾") || s.contains("⇒") -> "diag"
+        s.contains("⟨ядро⟩") || s.contains("[Xray]") -> "core"
+        else -> "info"
+    }
+
+    private fun logColor(kind: String, s: String): Color = when (kind) {
+        "err" -> Color(0xFFFF5A6E)
+        "warn" -> Color(0xFFFFB347)
+        "diag" -> Color(0xFFB39DFF)
+        "core" -> ZenGray
+        else -> if (s.contains("✅") || s.contains("✔")) ZenCyan else Color(0xFFCFE9E4)
+    }
+
+    @Composable
+    private fun LogChip(label: String, on: Boolean, onClick: () -> Unit) {
+        Box(Modifier.padding(end = 6.dp).clip(RoundedCornerShape(10.dp))
+            .background(if (on) ZenCyan.copy(alpha = 0.18f) else ZenCard)
+            .border(1.dp, if (on) ZenCyan else ZenDivider, RoundedCornerShape(10.dp))
+            .clickable { onClick() }.padding(horizontal = 10.dp, vertical = 6.dp)) {
+            Text(label, color = if (on) ZenCyan else Color.White, fontSize = 12.sp)
+        }
+    }
+
+    @Composable
+    private fun LogAction(icon: String, label: String, tint: Color = Color.White,
+                          modifier: Modifier = Modifier, onClick: () -> Unit) {
+        Column(modifier.clip(RoundedCornerShape(10.dp)).clickable { onClick() }
+            .padding(horizontal = 2.dp, vertical = 4.dp),
+            horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(icon, fontSize = 16.sp)
+            Text(label, color = tint, fontSize = 10.sp, maxLines = 1, softWrap = false)
+        }
+    }
+
+    private fun copyText(label: String, txt: String, n: Int) {
+        val cb = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        cb.setPrimaryClip(android.content.ClipData.newPlainText(label, txt))
+        toast("Скопировано строк: $n")
+    }
+
     @Composable
     private fun LogsTab() {
-        val scroll = rememberScrollState()
-        LaunchedEffect(logLines.size) { scroll.animateScrollTo(scroll.maxValue) }
-        Column(Modifier.fillMaxSize().padding(16.dp).verticalScroll(scroll)) {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Text("LOGS", color = Color.White, fontSize = 24.sp,
-                    fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                // Тот же разбор, что срабатывает при неудачном подключении,
-                // но по нажатию: спросить сеть можно и до того, как всё встало.
-                Text("сеть", color = ZenCyan, fontSize = 13.sp,
-                    modifier = Modifier.clickable { sniffRegime() })
-                Spacer(Modifier.width(14.dp))
-                // Спросить не про сеть, а про себя: что о нас видно снаружи.
-                // Доступно всегда, а не только при поднятом туннеле — вопрос
-                // «а он вообще работает?» возникает именно тогда, когда что-то
-                // не так.
-                Text("утечки", color = ZenCyan, fontSize = 13.sp,
-                    modifier = Modifier.clickable { showLeaks.value = true })
-                Spacer(Modifier.width(14.dp))
-                Text("падения", color = ZenCyan, fontSize = 13.sp,
-                    modifier = Modifier.clickable { dumpCrashLog() })
-                Spacer(Modifier.width(14.dp))
-                // Журнал переживает закрытие приложения — в отличие от того,
-                // что видно на этой вкладке.
-                Text("журнал", color = ZenCyan, fontSize = 13.sp,
-                    modifier = Modifier.clickable { showJournal.value = true })
-                Spacer(Modifier.width(14.dp))
-                Text("очистить", color = ZenGray, fontSize = 13.sp,
-                    modifier = Modifier.clickable { logLines.clear() })
+        Column(Modifier.fillMaxSize().padding(horizontal = 14.dp, vertical = 12.dp)) {
+            // Переключатель вкладок — как сегменты у INCY.
+            Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(ZenCard)
+                .border(1.dp, ZenDivider, RoundedCornerShape(14.dp)).padding(4.dp)) {
+                listOf("log" to "📜  Журнал", "cli" to "⌨️  Терминал").forEach { (k, l) ->
+                    val on = logTab.value == k
+                    Box(Modifier.weight(1f).clip(RoundedCornerShape(10.dp))
+                        .background(if (on) ZenCyan.copy(alpha = 0.18f) else Color.Transparent)
+                        .clickable { logTab.value = k }.padding(vertical = 9.dp),
+                        contentAlignment = Alignment.Center) {
+                        Text(l, color = if (on) ZenCyan else ZenGray, fontSize = 14.sp,
+                            fontWeight = if (on) FontWeight.Bold else FontWeight.Normal)
+                    }
+                }
             }
-            Spacer(Modifier.height(12.dp))
-            logLines.forEach { Text(it, color = ZenCyan, fontSize = 11.sp) }
+            Spacer(Modifier.height(10.dp))
+            if (logTab.value == "log") JournalPane() else TerminalPane()
+        }
+    }
+
+    // Порядок: поиск, фильтры, кнопки — и последним список, который забирает
+    // всё оставшееся место. Кнопки под списком 12.11.2026 на Xiaomi уезжали
+    // за нижнюю панель (список на весе Column сжимался до двух строк, а с
+    // расчётом высоты низ не помещался) — сверху им ничего не грозит.
+    @Composable
+    private fun JournalPane() {
+        val list = rememberLazyListState()
+        val filter = logFilter.value
+        val q = logQuery.value.trim()
+        val shown = logLines.withIndex().filter { (_, s) ->
+            (filter == "all" || logKind(s) == filter) && (q.isEmpty() || s.contains(q, ignoreCase = true))
+        }
+        LaunchedEffect(logLines.size, filter, q) {
+            if (shown.isNotEmpty()) list.scrollToItem(shown.size - 1)
+        }
+        Column(Modifier.fillMaxSize()) {
+            Column(Modifier.fillMaxWidth()) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("${shown.size} из ${logLines.size} строк", color = ZenGray, fontSize = 11.sp,
+                        modifier = Modifier.weight(1f))
+                    // Тот же разбор, что срабатывает при неудачном подключении,
+                    // но по нажатию: спросить сеть можно и до того, как всё встало.
+                    LogChip("🧾 сеть", false) { sniffRegime() }
+                    // Что о нас видно снаружи — доступно всегда, а не только при
+                    // поднятом туннеле: вопрос «работает ли» возникает, когда не так.
+                    LogChip("🔍 утечки", false) { showLeaks.value = true }
+                }
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = logQuery.value, onValueChange = { logQuery.value = it },
+                    placeholder = { Text("🔎  Текст, IP или домен", color = ZenGray, fontSize = 13.sp) },
+                    singleLine = true, modifier = Modifier.fillMaxWidth(),
+                    textStyle = androidx.compose.ui.text.TextStyle(color = Color.White, fontSize = 13.sp),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = ZenCyan, unfocusedBorderColor = ZenDivider, cursorColor = ZenCyan)
+                )
+                Spacer(Modifier.height(8.dp))
+                Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())) {
+                    listOf("all" to "Все", "err" to "Ошибки", "warn" to "Предупр.", "diag" to "Разбор",
+                        "core" to "Ядро", "info" to "События").forEach { (k, l) ->
+                        val n = if (k == "all") logLines.size else logLines.count { logKind(it) == k }
+                        LogChip("$l $n", filter == k) { logFilter.value = k }
+                    }
+                }
+                Spacer(Modifier.height(6.dp))
+            }
+            Row(Modifier.fillMaxWidth().padding(bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                LogAction("⧉", "Копия", modifier = Modifier.weight(1f)) {
+                    copyText("zen-log", shown.joinToString("\n") { it.value }, shown.size) }
+                LogAction("📤", "Послать", modifier = Modifier.weight(1f)) { shareJournal() }
+                LogAction("📓", "Полный", modifier = Modifier.weight(1f)) { showJournal.value = true }
+                LogAction("💥", "Падения", modifier = Modifier.weight(1f)) { dumpCrashLog() }
+                LogAction("🗑", "Очистить", Color(0xFFFF5A6E), Modifier.weight(1f)) { logLines.clear() }
+            }
+            Box(Modifier.fillMaxSize().clip(RoundedCornerShape(12.dp))
+                .background(Color(0xFF07080A)).border(1.dp, ZenDivider, RoundedCornerShape(12.dp))) {
+                androidx.compose.foundation.text.selection.SelectionContainer {
+                    LazyColumn(state = list, modifier = Modifier.fillMaxSize().padding(8.dp)) {
+                        items(shown, key = { it.index }) { (i, s) ->
+                            Row(Modifier.padding(vertical = 1.dp)) {
+                                Text("${i + 1}".padStart(3), color = Color(0xFF3A3D44), fontSize = 10.sp,
+                                    fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                                    modifier = Modifier.padding(end = 6.dp, top = 1.dp))
+                                Text(s, color = logColor(logKind(s), s), fontSize = 11.sp,
+                                    fontFamily = if (HEX_ROW.containsMatchIn(s))
+                                        androidx.compose.ui.text.font.FontFamily.Monospace else null)
+                            }
+                        }
+                    }
+                }
+                if (shown.isEmpty()) Text(if (logLines.isEmpty()) "Журнал пуст — подключитесь, и здесь пойдут события"
+                    else "Ничего не нашлось", color = ZenGray, fontSize = 12.sp,
+                    textAlign = TextAlign.Center, modifier = Modifier.align(Alignment.Center).padding(24.dp))
+            }
+        }
+    }
+    // Строки дампа по байтам («0000  16 03 01 …») — моноширинным, чтобы
+    // колонки hex и ASCII стояли ровно.
+    private val HEX_ROW = Regex("\\b[0-9a-f]{4} {2}[0-9a-f]{2} [0-9a-f]{2} ")
+
+    @Composable
+    private fun ColumnScope.TerminalPane() {
+        val list = rememberLazyListState()
+        var cmd by remember { mutableStateOf("") }
+        var histPos by remember { mutableStateOf(-1) }
+        LaunchedEffect(Unit) {
+            if (cliLines.isEmpty()) {
+                cliOut("ZEN NITRO · терминал управления клиентом")
+                cliOut("help — коротко все команды · helpzen — подробно и простыми словами")
+                cliOut("")
+            }
+        }
+        LaunchedEffect(cliLines.size) { if (cliLines.isNotEmpty()) list.scrollToItem(cliLines.size - 1) }
+        val mono = androidx.compose.ui.text.font.FontFamily.Monospace
+        Box(Modifier.weight(1f).fillMaxWidth().clip(RoundedCornerShape(12.dp))
+            .background(Color(0xFF040506)).border(1.dp, ZenCyan.copy(alpha = 0.35f), RoundedCornerShape(12.dp))) {
+            androidx.compose.foundation.text.selection.SelectionContainer {
+                LazyColumn(state = list, modifier = Modifier.fillMaxSize().padding(10.dp)) {
+                    items(cliLines.size) { i ->
+                        val s = cliLines[i]
+                        Text(s, fontSize = 12.sp, fontFamily = mono, color = when {
+                            s.startsWith("zen>") -> Color.White
+                            s.startsWith("━") || s.startsWith("▌") -> ZenCyan
+                            s.startsWith("  ✗") || s.startsWith("✗") -> Color(0xFFFF5A6E)
+                            s.startsWith("    ") -> Color(0xFF8FA8A3)
+                            else -> Color(0xFF9EF7E0)
+                        }, modifier = Modifier.padding(vertical = 1.dp))
+                    }
+                }
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        fun send() {
+            val c = cmd.trim(); if (c.isEmpty()) return
+            cliHistory.remove(c); cliHistory.add(c); histPos = -1
+            cmd = ""
+            runCli(c)
+        }
+        Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Color(0xFF040506))
+            .border(1.dp, ZenCyan.copy(alpha = 0.6f), RoundedCornerShape(12.dp)),
+            verticalAlignment = Alignment.CenterVertically) {
+            Text("zen>", color = ZenCyan, fontSize = 13.sp, fontWeight = FontWeight.Bold, fontFamily = mono,
+                modifier = Modifier.padding(start = 12.dp))
+            androidx.compose.foundation.text.BasicTextField(
+                value = cmd, onValueChange = { cmd = it }, singleLine = true,
+                textStyle = androidx.compose.ui.text.TextStyle(color = Color.White, fontSize = 13.sp, fontFamily = mono),
+                cursorBrush = androidx.compose.ui.graphics.SolidColor(ZenCyan),
+                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                    imeAction = androidx.compose.ui.text.input.ImeAction.Send, autoCorrectEnabled = false),
+                keyboardActions = androidx.compose.foundation.text.KeyboardActions(onSend = { send() }),
+                modifier = Modifier.weight(1f).padding(horizontal = 8.dp, vertical = 12.dp),
+                decorationBox = { inner ->
+                    if (cmd.isEmpty()) Text("команда… (help)", color = Color(0xFF4A4D55), fontSize = 13.sp, fontFamily = mono)
+                    inner()
+                })
+            // ↑ — прошлые команды по кругу, как в обычном терминале.
+            Text("↑", color = ZenGray, fontSize = 16.sp, modifier = Modifier.clickable {
+                if (cliHistory.isEmpty()) return@clickable
+                histPos = if (histPos <= 0) cliHistory.size - 1 else histPos - 1
+                cmd = cliHistory[histPos]
+            }.padding(horizontal = 8.dp, vertical = 10.dp))
+            Text("⏎", color = ZenCyan, fontSize = 16.sp, modifier = Modifier.clickable { send() }
+                .padding(start = 4.dp, end = 12.dp, top = 10.dp, bottom = 10.dp))
+        }
+        // Быстрые команды — нажал, и она выполнилась.
+        Row(Modifier.fillMaxWidth().padding(top = 6.dp).horizontalScroll(rememberScrollState())) {
+            listOf("status", "helpzen", "ping", "diag", "flow", "net", "wl", "get", "tail").forEach { c ->
+                LogChip(c, false) { runCli(c) }
+            }
+        }
+        Row(Modifier.fillMaxWidth().padding(top = 6.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
+            LogAction("⧉", "Копировать") { copyText("zen-cli", cliLines.joinToString("\n"), cliLines.size) }
+            LogAction("📜", "В журнал") { logTab.value = "log" }
+            LogAction("🗑", "Очистить", Color(0xFFFF5A6E)) { cliLines.clear() }
+        }
+    }
+
+    // ---------------------------------------------------------- терминал
+    //
+    // Управление клиентом командами — то же, что кнопки, плюс то, до чего
+    // кнопками долго: переключатели «Соединения», список нод с фильтром,
+    // разбор линии и соединений. Ответ — в экран терминала; действия,
+    // которые что-то меняют, ещё и строкой «⌨️ терминал: …» в журнал.
+    private class CliCmd(val name: String, val alias: String, val short: String,
+                         val what: String, val helps: String, val example: String)
+
+    private val CLI = listOf(
+        CliCmd("status", "st, статус", "как дела у туннеля",
+            "Показывает, подключено ли сейчас, к какой ноде, какой пинг, сколько идёт " +
+                "скорости вниз и вверх, в какой стране выход и что за сеть у телефона.",
+            "Первая команда, когда «что-то не так»: сразу видно — туннель лежит, " +
+                "нода не та или просто сеть плохая.",
+            "status"),
+        CliCmd("connect", "on, up", "подключиться",
+            "То же, что нажать на большое кольцо: поднимает туннель к выбранной ноде.",
+            "Если руки уже в терминале — не надо возвращаться на главный экран.",
+            "connect"),
+        CliCmd("disconnect", "off, down", "отключиться",
+            "Гасит туннель. Интернет пойдёт напрямую, без VPN.",
+            "Когда нужно быстро выключить VPN, например для банка.",
+            "disconnect"),
+        CliCmd("reconnect", "re", "переподключиться",
+            "Опускает туннель и сразу поднимает заново на той же ноде.",
+            "Если после смены настроек (set …) нужно применить их прямо сейчас.",
+            "reconnect"),
+        CliCmd("nodes", "ls, ноды", "список нод",
+            "Показывает ноды с номерами: имя, протокол, пинг; «БС» — годится для белых " +
+                "списков. Можно дописать слово, и останутся только подходящие.",
+            "Найти ноду по стране или протоколу, не листая длинный список.",
+            "nodes reality   ·   nodes 🇫🇮"),
+        CliCmd("wl", "бс", "ноды для белых списков",
+            "Показывает только ноды, которые годятся, когда оператор включил белые списки " +
+                "(пускает лишь на разрешённые сайты).",
+            "В день белых списков обычные ноды не работают — эта команда сразу покажет, на что переключиться.",
+            "wl"),
+        CliCmd("use", "node, выбрать", "выбрать ноду",
+            "Выбирает ноду по номеру из nodes или по кусочку имени. Если туннель уже " +
+                "поднят — переключится на неё на ходу.",
+            "Быстро пересесть на другую ноду одной строкой.",
+            "use #12   ·   use Finland"),
+        CliCmd("ping", "пинг", "перемерить ноды",
+            "Заново проверяет, какие ноды отвечают и насколько быстро. Результат — в списке нод и в журнале.",
+            "Понять, какие ноды живые прямо сейчас, а какие молчат.",
+            "ping"),
+        CliCmd("diag", "probe, разбор", "разбор линии по байтам",
+            "Проверяет дорогу до выбранной ноды по шагам: адрес, TCP, приветствие TLS или QUIC — " +
+                "и показывает, на каком шаге всё оборвалось, с дампом байтов. Итог — в журнале (🩺).",
+            "Отвечает на главный вопрос «почему не открылось»: сервер выключен, адрес заблокирован, " +
+                "имя режут или сеть сама не работает.",
+            "diag"),
+        CliCmd("flow", "поток", "кто из соединений молчит",
+            "Смотрит все соединения через туннель прямо сейчас: какие отдают и получают байты, " +
+                "а какие «немые» (ушло — и ни байта в ответ). Итог — в журнале (🧪).",
+            "Когда «подключено, а не грузит»: видно, режут всё или только отдельные сайты.",
+            "flow"),
+        CliCmd("net", "сеть", "опрос сети",
+            "Стучится на разрешённые российские сайты и на заграничные и говорит, что сегодня " +
+                "пропускает оператор: всё, только белые списки или ничего.",
+            "Сразу понятно, виновата нода или оператор включил белые списки.",
+            "net"),
+        CliCmd("dns", "", "проверить DNS",
+            "Проверяет, превращаются ли имена сайтов в адреса через туннель.",
+            "Если «канал есть, а сайты не открываются» — часто виноват именно DNS.",
+            "dns"),
+        CliCmd("leaks", "утечки", "проверка утечек",
+            "Открывает проверку: какой IP и DNS видят сайты снаружи.",
+            "Убедиться, что трафик правда идёт через VPN и настоящий адрес не светится.",
+            "leaks"),
+        CliCmd("subs", "update, подписки", "обновить подписки",
+            "Заново скачивает ноды из всех подписок.",
+            "Провайдер добавил новые сервера или поменял адреса — подтянуть их.",
+            "subs"),
+        CliCmd("cores", "ядра", "обновления ядер",
+            "Спрашивает сервер, нет ли свежих ядер Xray и Amnezia, и ставит их, если можно.",
+            "Новые ядра чинят обход и скорость. Xray весит ~31 МБ, поэтому по мобильной сети сам не качается.",
+            "cores"),
+        CliCmd("get", "", "показать настройки соединения",
+            "Показывает mux, нарезку, блок QUIC, отпечаток TLS, стек TUN, автопереход и kill switch.",
+            "Перед тем как что-то менять — посмотреть, что стоит сейчас.",
+            "get"),
+        CliCmd("set", "", "поменять настройку",
+            "Меняет настройку соединения. Включить — on, выключить — off.\n" +
+                "    mux — несколько потоков в одном соединении (обычно лучше off)\n" +
+                "    frag — резать TLS-приветствие на куски против DPI (обычно on)\n" +
+                "    quic — запрещать QUIC на TCP-нодах, чтобы YouTube шёл по TCP (обычно on)\n" +
+                "    autoswitch — самому переходить на другую ноду, если своя не встаёт\n" +
+                "    killswitch — без туннеля интернет закрыт совсем\n" +
+                "    armor — броня от распознавания (отпечаток, нарезка)\n" +
+                "    fp light|ios|chrome|firefox — под какой браузер притворяться\n" +
+                "    stack auto|gvisor|system|mixed — как телефон отдаёт трафик в туннель",
+            "Покрутить настройки без лазанья по меню. Применится при следующем подключении " +
+                "(или сразу — командой reconnect).",
+            "set mux off   ·   set fp ios   ·   set stack gvisor"),
+        CliCmd("tail", "", "последние строки журнала",
+            "Показывает здесь последние строки живого журнала (по умолчанию 20).",
+            "Посмотреть, что ответили diag, flow или net, не уходя из терминала.",
+            "tail   ·   tail 50"),
+        CliCmd("report", "journal, журнал", "журнал отладки",
+            "Кладёт в живой журнал отчёт: обстановка, последние подключения и чем они кончились.",
+            "Собрать картину за последние часы в одном месте.",
+            "report"),
+        CliCmd("share", "отправить", "отправить журнал",
+            "Собирает файл журнала и открывает «Поделиться» — в Telegram, почту, куда угодно.",
+            "Отправить журнал разработчику, чтобы разобрал проблему.",
+            "share"),
+        CliCmd("ver", "version, версия", "версии",
+            "Показывает версию Zen Nitro и ядер sing-box и Xray.",
+            "Понять, обновилось ли приложение и ядра.",
+            "ver"),
+        CliCmd("clear", "cls", "очистить экран",
+            "Стирает вывод терминала (живой журнал не трогает).",
+            "Когда экран забит и хочется начать с чистого листа.",
+            "clear"),
+        CliCmd("help", "?", "краткий список", "Показывает все команды одной строкой каждая.",
+            "Вспомнить, как называется нужная команда.", "help"),
+        CliCmd("helpzen", "", "подробная справка",
+            "Подробно и простыми словами о каждой команде: что делает, чем помогает, пример. " +
+                "Можно спросить про одну: helpzen diag.",
+            "Разобраться с терминалом с нуля.", "helpzen   ·   helpzen set")
+    )
+
+    private fun helpZen(about: String) {
+        fun one(c: CliCmd) {
+            cliOut("▌ ${c.name}" + (if (c.alias.isNotEmpty()) "   (или: ${c.alias})" else "") + " — ${c.short}")
+            cliOut("    Что делает: ${c.what}")
+            cliOut("    Чем помогает: ${c.helps}")
+            cliOut("    Пример: ${c.example}")
+            cliOut("")
+        }
+        if (about.isNotEmpty()) {
+            val c = CLI.firstOrNull { it.name == about || it.alias.split(", ").contains(about) }
+            if (c == null) cliOut("  ✗ нет такой команды: $about — helpzen без слов покажет все") else one(c)
+            return
+        }
+        cliOut("━━━━━━━━━━ HELPZEN — как пользоваться терминалом ━━━━━━━━━━")
+        cliOut("Терминал — это пульт управления Zen Nitro словами.")
+        cliOut("Пишешь команду в строку внизу после «zen>» и жмёшь ⏎ (или «Отправить» на клавиатуре).")
+        cliOut("Стрелка ↑ возвращает прошлые команды. Кнопки под строкой — самые нужные, жми прямо их.")
+        cliOut("Большие буквы не важны: STATUS = status. Многие команды понимают и по-русски.")
+        cliOut("Ответы пишутся сюда. Подробные разборы (diag, flow, net) — во вкладку «Журнал».")
+        cliOut("")
+        cliOut("━━ Если интернет не работает — по порядку:")
+        cliOut("    1) status — туннель вообще поднят? какая нода?")
+        cliOut("    2) net — может, оператор включил белые списки или сеть сама лежит")
+        cliOut("    3) diag — где именно рвётся дорога до ноды")
+        cliOut("    4) flow — если «подключено, а не грузит»: какие соединения немые")
+        cliOut("    5) wl / nodes — выбрать другую ноду, потом use #номер")
+        cliOut("    6) share — отправить журнал, если не помогло")
+        cliOut("")
+        cliOut("━━ Все команды:")
+        CLI.forEach { one(it) }
+        cliOut("━━━━━━━━━━ конец справки · helpzen <команда> — про одну ━━━━━━━━━━")
+    }
+
+    private fun runCli(line: String) {
+        cliOut("zen> $line")
+        fun out(s: String) = cliOut("  $s")
+        fun toJournal(s: String) { out(s); log("⌨️ терминал: $s") }
+        val parts = line.trim().split(Regex("\\s+"))
+        val c = parts[0].lowercase()
+        val arg = parts.drop(1).joinToString(" ")
+        fun onOff(v: String): Boolean? = when (v.lowercase()) {
+            "on", "1", "вкл", "да", "true" -> true
+            "off", "0", "выкл", "нет", "false" -> false
+            else -> null
+        }
+        fun nodeLine(i: Int, n: Node) = "#$i ${n.name} [${n.badge()}] " +
+            (if (n.ping in 1..899) "${n.ping} мс" else "—") + (if (n.wlCapable()) " · БС" else "")
+        val toLog = "  → ответ придёт во вкладку «Журнал» (или: tail)"
+        when (c) {
+            "help", "?", "помощь", "h" -> {
+                CLI.forEach { out("${it.name.padEnd(11)} ${it.short}") }
+                out("подробно и простыми словами: helpzen   ·   про одну: helpzen <команда>")
+            }
+            "helpzen", "хелп" -> helpZen(arg.lowercase())
+            "status", "st", "статус" -> {
+                val st = when (connState.intValue) { 0 -> "отключено"; 1 -> "подключаюсь…"; else -> "подключено" }
+                out("туннель: $st" + Stats.stage.value.let { if (it.isNotEmpty()) " · $it" else "" })
+                nodes.getOrNull(selected.intValue)?.let { out("нода: ${nodeLine(selected.intValue, it)}") }
+                if (connState.intValue == 2) {
+                    out("ядро: ${Stats.mode.value} · пинг ${Stats.ping.value} мс · " +
+                        "↓ ${Stats.down.value / 1024} КБ/с ↑ ${Stats.up.value / 1024} КБ/с")
+                    if (Stats.exitPlace.value.isNotEmpty()) out("выход: ${Stats.exitPlace.value} ${Stats.exitIp.value}")
+                }
+                out("сеть: ${com.zen.blaster.core.NetInfo.line(this)}")
+            }
+            "connect", "on", "up", "подключить" ->
+                if (connState.intValue != 0) out("уже ${if (connState.intValue == 1) "подключаюсь" else "подключено"}")
+                else { toJournal("подключаю"); toggle() }
+            "disconnect", "off", "down", "отключить" ->
+                if (connState.intValue == 0) out("и так отключено") else { toJournal("отключаю"); stopTunnel() }
+            "reconnect", "re" ->
+                if (connState.intValue == 0) { toJournal("подключаю"); toggle() }
+                else { toJournal("переподключаю"); switchServer(selected.intValue) }
+            "nodes", "ls", "ноды" -> {
+                val f = nodes.withIndex().filter { (_, n) -> arg.isEmpty() ||
+                    n.name.contains(arg, true) || n.sub.contains(arg, true) || n.badge().contains(arg, true) }
+                f.take(40).forEach { (i, n) -> out(nodeLine(i, n)) }
+                out("всего ${f.size}" + (if (f.size > 40) ", показал 40 — уточни: nodes <слово>" else "") +
+                    " · выбрать: use #номер")
+            }
+            "wl", "бс" -> {
+                val f = nodes.withIndex().filter { it.value.wlCapable() }
+                f.take(40).forEach { (i, n) -> out(nodeLine(i, n)) }
+                out("нод для белых списков: ${f.size}" + (if (f.isNotEmpty()) " · выбрать: use #номер" else ""))
+            }
+            "use", "node", "select", "выбрать" -> {
+                if (arg.isEmpty()) { out("✗ напиши, какую: use #12 или use Finland"); return }
+                val idx = arg.removePrefix("#").toIntOrNull()?.takeIf { it in nodes.indices }
+                    ?: nodes.indexOfFirst { it.name.contains(arg, true) }.takeIf { it >= 0 }
+                if (idx == null) { out("✗ нода «$arg» не найдена — поищи: nodes $arg"); return }
+                toJournal("выбрана ${nodeLine(idx, nodes[idx])}")
+                switchServer(idx)
+            }
+            "ping", "пинг" -> { out("меряю ноды…$toLog"); repingAll() }
+            "diag", "probe", "разбор" -> { out("разбираю линию до ноды…$toLog"); probeActive() }
+            "flow", "поток" ->
+                if (connState.intValue != 2) out("✗ туннель не поднят — разбирать нечего (connect)")
+                else {
+                    out("смотрю соединения…$toLog")
+                    startService(Intent(this, ZenVpnService::class.java).apply { action = ZenVpnService.ACTION_FLOW })
+                }
+            "net", "сеть" -> { out("опрашиваю сеть…$toLog"); sniffRegime() }
+            "dns" -> { out("проверяю DNS…$toLog"); checkDns() }
+            "leaks", "утечки" -> showLeaks.value = true
+            "subs", "update", "подписки" -> { out("обновляю подписки…$toLog"); loadServers() }
+            "cores", "ядра" -> {
+                out("спрашиваю сервер ядер…")
+                lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    val left = com.zen.blaster.core.CoreAuto.run(this@MainActivity, force = true) { m -> runOnUiThread { log(m); out(m) } }
+                    runOnUiThread {
+                        when {
+                            left == null -> out("✗ сервер ядер не ответил (storage-mess.online) — попробуй позже")
+                            left.isEmpty() -> out("ядра свежие — ставить нечего")
+                            else -> out("ждут: ${com.zen.blaster.core.CoreAuto.offerText(left)} " +
+                                "(Xray по мобильной сети сам не качаем — Настройки → Ядра)")
+                        }
+                    }
+                }
+            }
+            "tail", "хвост" -> {
+                val n = arg.toIntOrNull()?.coerceIn(1, 200) ?: 20
+                logLines.takeLast(n).forEach { cliOut("    $it") }
+                if (logLines.isEmpty()) out("журнал пуст")
+            }
+            "report", "journal", "журнал" -> { out("кладу отчёт в журнал…$toLog"); dumpJournal() }
+            "share", "отправить" -> shareJournal()
+            "clear", "cls" -> cliLines.clear()
+            "ver", "version", "версия" -> {
+                out("Zen Nitro ${packageManager.getPackageInfo(packageName, 0).versionName}")
+                out("sing-box ${io.nekohasekai.libbox.Libbox.version()} · Xray ${XrayEngine.version(this, builtin = false)}")
+            }
+            "get" -> {
+                fun f(b: Boolean) = if (b) "on" else "off"
+                out("mux ${f(prefs.muxOn)} · frag ${f(prefs.fragOn)} · quic ${f(prefs.blockQuic)} · armor ${f(prefs.armor)}")
+                out("fp ${prefs.tlsFpChoice} · stack ${prefs.tunStack} · autoswitch ${f(prefs.autoSwitchNode)} · " +
+                    "killswitch ${f(prefs.killSwitch)}")
+            }
+            "set" -> {
+                val k = parts.getOrNull(1)?.lowercase().orEmpty()
+                val v = parts.getOrNull(2).orEmpty()
+                val b = onOff(v)
+                val done = when (k) {
+                    "mux" -> b?.let { prefs.muxOn = it }
+                    "frag" -> b?.let { prefs.fragOn = it }
+                    "quic" -> b?.let { prefs.blockQuic = it }
+                    "autoswitch" -> b?.let { prefs.autoSwitchNode = it }
+                    "killswitch" -> b?.let { prefs.killSwitch = it }
+                    "armor" -> b?.let { prefs.armor = it }
+                    "fp" -> v.lowercase().takeIf { it in setOf("light", "ios", "chrome", "firefox") }
+                        ?.let { prefs.tlsFpChoice = it }
+                    "stack" -> v.lowercase().takeIf { it in setOf("auto", "gvisor", "system", "mixed") }
+                        ?.let { prefs.tunStack = it }
+                    else -> null
+                }
+                if (done == null) out("✗ не понял «set $k $v» — подробно: helpzen set")
+                else {
+                    prefs.applyTuning()
+                    toJournal("$k = ${v.lowercase()} — применится при следующем подключении (сейчас: reconnect)")
+                }
+            }
+            else -> out("✗ нет такой команды: $c — список: help, подробно: helpzen")
         }
     }
 

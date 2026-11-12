@@ -166,7 +166,10 @@ object NetInfo {
                 .append(if (k >= 1000) "${k / 1000} Мбит/с" else "$k Кбит/с")
             if (slowMobile(ctx)) append(" · МЕДЛЕННЫЙ")
             if (s.roaming) append(" · роуминг")
-            if (s.vpn) append(" · поверх уже есть VPN")
+            // Наш же туннель — не «чужой VPN»: при sing-box приложение внутри
+            // него, и активная сеть для нас — наш VPN (журнал 11.11 писал
+            // «поверх уже есть VPN» на каждой проверке).
+            if (s.vpn && !com.zen.blaster.vpn.ZenVpnService.running) append(" · поверх уже есть VPN")
         }
     }
 }

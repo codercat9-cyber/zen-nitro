@@ -102,7 +102,7 @@ object WhitelistSniff {
 
     // Что сказать человеку. Возвращает строки для журнала — пустой список,
     // если сказать нечего и лезть с советом не надо.
-    fun explain(v: Verdict, wlNodes: Int, frontable: Int): List<String> = when {
+    fun explain(v: Verdict, wlNodes: Int, frontable: Int, names: List<String> = emptyList()): List<String> = when {
         v.noNetwork -> listOf("… сети нет вовсе — вердикт по белым спискам не выношу")
         v.spotty -> listOf(
             "📶 Сеть работает рывками: разрешённые ${v.allowedOk}/3, заграничные ${v.neutralOk}/3.",
@@ -118,12 +118,16 @@ object WhitelistSniff {
                 add("   ⚠️ Аварийных нод у вас нет. Настройки → «Аварийный арсенал», " +
                     "добавьте ноду с прикрытием под разрешённый домен.")
             else {
-                add("   ✔ В аварийном арсенале ${wlNodes} нод(ы), с прикрытием — $frontable.")
+                // Считаем и белосписочные ноды подписок (Node.wlCapable), а не
+                // только свою аварийную группу: 11.11.2026 «В аварийном
+                // арсенале 2» при двадцати БС-нодах Sirius и Пантеры.
+                add("   ✔ Нод для белых списков: $wlNodes, пригодных — $frontable.")
                 if (frontable == 0)
                     add("   ⚠️ Ни одной пригодной: у Reality и голого TCP имя подменить нельзя. " +
                         "Нужна WS или XHTTP через CDN.")
                 else
-                    add("   Выберите ноду из группы «⚪ Белый список (аварийные)».")
+                    add("   Беру одну из них: " + names.joinToString(", ") { "«$it»" } +
+                        (if (wlNodes > names.size) " …" else "") + ".")
             }
         }
     }

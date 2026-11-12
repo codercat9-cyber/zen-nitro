@@ -52,6 +52,12 @@ object NodeConfig {
         // Потолок с запасом вниз: переоценить канал в Brutal опаснее, чем
         // недооценить; оценка сотовой сети у Android почти всегда завышена.
         val cap = (kbps * (if (mobile) 3 else 4) / 5 / 1000).coerceAtLeast(1)
+        // Узкий потолок на сотовой — не заявляем вовсе. Оценка канала у
+        // Android на LTE — константа оператора, а не замер: 10–12.11.2026 на
+        // Tele2 22 подъёма Hysteria2 ушли в Brutal 1↓/1↑ Мбит/с, и весь сеанс
+        // был зажат в мегабит — Telegram отдавал 4,7 МБ и ждал. BBR сам
+        // найдёт настоящий потолок, а Brutal ниже 8 Мбит/с ничего не выигрывает.
+        if (mobile && cap < 8) return 0 to 0
         return if (want.first <= cap) want
                else cap to (want.second * cap / want.first).coerceAtLeast(1)
     }
@@ -64,13 +70,13 @@ object NodeConfig {
         val viaXray = prefersXray(ctx, prefs, n)
         val fp = if (prefs.armor) ConfigBuilder.pickFingerprint() else ""
         val front = when {
-            n.whitelistNative() -> ""
+            n.wlLike() -> ""
             prefs.whitelistMode -> prefs.whitelistDomain.trim()
             else -> ""
         }
         val xray = if (viaXray)
             XrayEngine.buildConfig(n, prefs.armor, fp,
-                viaDpi = prefs.chainVpnViaDpi && dpiOn && !n.wl, frontDomain = front,
+                viaDpi = prefs.chainVpnViaDpi && dpiOn && !n.wlLike(), frontDomain = front,
                 bait = AwgBait.fromProfiles(prefs.awgProfiles())).toString()
         else ""
         val (hyDown, hyUp) = brutal(ctx, prefs)
@@ -124,7 +130,7 @@ object NodeConfig {
                 // Выпавшая из выдачи и ни разу не отвечавшая — не кандидат.
                 (!n.gone || n.ping in 1..899 || n.lastOkAt > 0L) &&
                 // В режиме белых списков — только аварийные (как у каскада).
-                (!prefs.whitelistMode || n.wl)
+                (!prefs.whitelistMode || n.wlCapable())
         }
         return cand.sortedWith(
             // Аварийные (белый список) — последними, если режим белых списков

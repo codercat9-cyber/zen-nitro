@@ -196,6 +196,12 @@ data class Node(
 
     // Домены, которые у операторов лежат в белых списках: раздатчики статики
     // VK и Яндекса, куда ходят все и постоянно.
+    // «белые списки», «белый список», «(БС)», «WL», «whitelist». Буквы рядом
+    // не должны стоять: «БС» внутри слова — не наш случай.
+    private val WL_NAME = Regex(
+        "бел(ые|ый|ых|ом)\\s*спис|(?<![\\p{L}])бс(?![\\p{L}])|(?<![\\p{L}])wl(?![\\p{L}])|white\\s*-?list",
+        RegexOption.IGNORE_CASE)
+
     private val WHITELIST = listOf(
         "userapi.com", "vk.com", "vk.ru", "vkuser", "vkvideo", "mycdn.me",
         "yandex.ru", "yandex.net", "yastatic.net", "mail.ru", "gosuslugi.ru"
@@ -210,6 +216,35 @@ data class Node(
     fun whitelistNative(): Boolean {
         val name = (sni.ifEmpty { host }).lowercase()
         return name.isNotEmpty() && WHITELIST.any { name.contains(it) }
+    }
+
+    // БЕЛОСПИСОЧНАЯ ПО НАЗВАНИЮ: провайдер сам сказал, что нода — для белых
+    // списков. Наш флаг wl стоит только у своей аварийной группы, а у людей
+    // такие ноды приходят из подписок: «🔲WL | siriusvpn…», «🇫🇷 Белые
+    // списки #1», «🇸🇴 АВТО ОБХОД ( БС ) 🐾». 11.11.2026 в режиме белых
+    // списков Zen считал «аварийными» две ноды Триллера и не видел двадцати
+    // других — ни для совета, ни для перехода.
+    fun wlNamed(): Boolean = wl || WL_NAME.containsMatchIn(name) || WL_NAME.containsMatchIn(sub)
+
+    // Годится для белых списков: провайдер так её назвал или она ходит под
+    // именем VK/Яндекса. Просто российский SNI сюда не входит — у Reality с
+    // «avito.ru» сервер часто за границей, и белые списки его адрес не пустят.
+    fun wlCapable(): Boolean = wlNamed() || whitelistNative()
+
+    // НОДА ПОД РАЗРЕШЁННЫМ ИМЕНЕМ: белосписочная по названию, маскируется
+    // под VK/Яндекс или идёт с российским SNI (.ru/.рф/.su).
+    //
+    // Такой ноде нельзя резать приветствие. Нарезка нужна, чтобы ТСПУ не
+    // прочёл ЗАПРЕЩЁННОЕ имя; а здесь имя разрешённое, и при белых списках
+    // ТСПУ пропускает только тех, у кого он его прочёл. 11.11.2026, «Белые
+    // списки #1» (SNI x5media.ru): наш зонд с целым приветствием получил
+    // ServerHello за 2 с, а Xray с нарезкой — 44 дозвона, 2 соединения и
+    // сброс за сбросом.
+    fun wlLike(): Boolean {
+        if (wlNamed() || whitelistNative()) return true
+        val s = sni.ifEmpty { host }.lowercase().trimEnd('.')
+        return s.endsWith(".ru") || s.endsWith(".su") || s.endsWith(".рф") ||
+            s.endsWith(".xn--p1ai") || s == "ok.ru" || s.endsWith(".ok.ru")
     }
 
     // Можно ли прикрыть ноду чужим доменом, если она сама этого не делает.
