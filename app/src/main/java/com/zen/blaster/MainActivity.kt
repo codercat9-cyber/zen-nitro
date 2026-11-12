@@ -183,6 +183,8 @@ class MainActivity : ComponentActivity() {
     // Имя НЕ proxyMode: внутри toggleConnect живёт одноимённая локальная
     // переменная, и перекрытие читалось бы как ошибка.
     private val useProxy = mutableStateOf(false)
+    // Режим туннеля для экрана: tun_proxy / tun / proxy (Prefs.tunnelMode).
+    private val tunMode = mutableStateOf("tun")
 
     // Чем поднимать ноду: 0 — авто, 1 — sing-box, 2 — Xray.
     private val tunEngine = mutableIntStateOf(0)
@@ -446,6 +448,7 @@ class MainActivity : ComponentActivity() {
         titleSize.intValue = prefs.titleSize
         splitRu.value = prefs.geoRouting
         useProxy.value = prefs.proxyMode
+        tunMode.value = prefs.tunnelMode
         tunEngine.intValue = prefs.tunnelEngine
         // Совет подписки переживает перезапуск: иначе «Авто» до первой
         // загрузки подписок оставалось бы ни с чем.
@@ -2558,14 +2561,15 @@ class MainActivity : ComponentActivity() {
                     Text("КАК ПОДНИМАТЬ НОДУ", color = ZenRed, fontSize = 12.sp,
                         fontWeight = FontWeight.Bold)
                     Row(Modifier.fillMaxWidth().padding(top = 6.dp)) {
-                        listOf(false to "Туннель", true to "Прокси").forEach { (v, label) ->
-                            val on = useProxy.value == v
+                        listOf("tun_proxy" to "TUN + прокси", "tun" to "Только TUN", "proxy" to "Только прокси")
+                                .forEach { (v, label) ->
+                            val on = tunMode.value == v
                             Surface(
                                 color = if (on) ZenRed.copy(alpha = 0.26f) else ZenBg,
                                 shape = RoundedCornerShape(8.dp),
                                 modifier = Modifier.weight(1f).padding(end = 5.dp)
                                     .clip(RoundedCornerShape(8.dp))
-                                    .clickable { switchProxyMode(v) }
+                                    .clickable { switchTunnelMode(v) }
                             ) {
                                 Text(label, color = if (on) Color.White else ZenGray, fontSize = 12.sp,
                                     maxLines = 1, textAlign = TextAlign.Center,
@@ -2574,11 +2578,15 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                     Text(
-                        if (useProxy.value)
-                            "Ядро слушает SOCKS5 и HTTP на 127.0.0.1:${Prefs.PROXY_PORT}. " +
-                            "Маршруты системы не трогаются, разрешение VPN не нужно — " +
-                            "через ноду идёт только тот, кто этот порт себе прописал."
-                        else "Системный VPN: в туннель уходит весь трафик телефона.",
+                        when (tunMode.value) {
+                            "proxy" -> "Ядро слушает SOCKS5 и HTTP на 127.0.0.1:${Prefs.PROXY_PORT}. " +
+                                "Маршруты системы не трогаются, разрешение VPN не нужно — " +
+                                "через ноду идёт только тот, кто этот порт себе прописал."
+                            "tun_proxy" -> "Системный VPN для всего телефона и рядом SOCKS5/HTTP на " +
+                                "127.0.0.1:${Prefs.PROXY_PORT} для приложений с прокси" +
+                                (if (prefs.localAuth) " — с логином и паролем (Настройки → Режим туннеля)." else ".")
+                            else -> "Системный VPN: в туннель уходит весь трафик телефона."
+                        },
                         color = ZenGray, fontSize = 11.sp, modifier = Modifier.padding(top = 6.dp)
                     )
                 }
@@ -2606,6 +2614,19 @@ class MainActivity : ComponentActivity() {
             lifecycleScope.launch { kotlinx.coroutines.delay(900); toggleConnect(force = true) }
         }
     }
+    // Смена режима туннеля из любого места (окно «Режимы», настройки, терминал):
+    // одно состояние на экране и переподъём, если уже подключены.
+    private fun switchTunnelMode(k: String) {
+        if (tunMode.value == k && prefs.tunnelMode == k) return
+        tunMode.value = k; prefs.tunnelMode = k; useProxy.value = k == "proxy"
+        log("🔀 Режим туннеля: " + TUNNEL_MODES.first { it.first == k }.second)
+        if (connState.intValue != 0) {
+            log("🔄 Смена режима — переподключаюсь…")
+            stopTunnel()
+            lifecycleScope.launch { kotlinx.coroutines.delay(900); toggleConnect(force = true) }
+        }
+    }
+
     private fun switchProxyMode(v: Boolean) {
         if (useProxy.value == v) return
         useProxy.value = v
@@ -3605,6 +3626,8 @@ class MainActivity : ComponentActivity() {
                 Text(
                     "  " + when {
                         prefs.vpnEnabled && prefs.dpiEnabled -> "VPN + DPI-щит"
+                        prefs.vpnEnabled && tunMode.value == "proxy" -> "Режим прокси"
+                        prefs.vpnEnabled && tunMode.value == "tun_proxy" -> "Режим VPN + прокси"
                         prefs.vpnEnabled -> "Режим VPN"
                         prefs.dpiEnabled -> "Режим DPI-щита"
                         else -> "Режим не выбран"
@@ -4249,7 +4272,7 @@ class MainActivity : ComponentActivity() {
             SetGroup("СЕТЬ")
             SetCard(Icons.Outlined.Router, "Режим туннеля", "TUN + прокси, только TUN или только прокси") {
             // РЕЖИМ ТУННЕЛЯ — как у INCY: TUN + прокси / только TUN / только прокси.
-            var mode by remember { mutableStateOf(prefs.tunnelMode) }
+            val mode = tunMode.value
             var authOn by remember { mutableStateOf(prefs.localAuth) }
             var creds by remember { mutableStateOf(prefs.localUser to prefs.localPass) }
             fun reconnectIfUp() {
@@ -4259,13 +4282,7 @@ class MainActivity : ComponentActivity() {
                 lifecycleScope.launch { kotlinx.coroutines.delay(900); toggleConnect(force = true) }
             }
             TUNNEL_MODES.forEach { (k, title, sub) ->
-                ModeOption(title, sub, mode == k) {
-                    if (mode != k) {
-                        mode = k; prefs.tunnelMode = k; useProxy.value = k == "proxy"
-                        log("🔀 Режим туннеля: $title")
-                        reconnectIfUp()
-                    }
-                }
+                ModeOption(title, sub, mode == k) { switchTunnelMode(k) }
             }
             if (mode != "tun") {
                 HorizontalDivider(color = ZenDivider, modifier = Modifier.padding(vertical = 10.dp))
@@ -5659,7 +5676,7 @@ class MainActivity : ComponentActivity() {
                     "mode" -> when (v.lowercase()) {
                         "tun" -> "tun"; "tun+proxy", "tun_proxy", "tunproxy", "both" -> "tun_proxy"
                         "proxy" -> "proxy"; else -> null
-                    }?.let { prefs.tunnelMode = it; useProxy.value = it == "proxy" }
+                    }?.let { switchTunnelMode(it) }
                     "auth" -> b?.let { prefs.localAuth = it }
                     "theme" -> ZEN_THEMES.firstOrNull { it.id == v.lowercase() }
                         ?.let { prefs.themeId = it.id; setZenTheme(it.id) }
@@ -5674,7 +5691,11 @@ class MainActivity : ComponentActivity() {
                 if (done == null) out("✗ не понял «set $k $v» — подробно: helpzen set")
                 else {
                     prefs.applyTuning()
-                    toJournal("$k = ${v.lowercase()} — применится при следующем подключении (сейчас: reconnect)")
+                    toJournal("$k = ${v.lowercase()} — " + when (k) {
+                        "theme" -> "тема включена"
+                        "mode" -> if (connState.intValue != 0) "переподключаюсь в новом режиме" else "режим выбран"
+                        else -> "применится при следующем подключении (сейчас: reconnect)"
+                    })
                 }
             }
             else -> out("✗ нет такой команды: $c — список: help, подробно: helpzen")
