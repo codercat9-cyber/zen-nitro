@@ -54,3 +54,48 @@ class WhitelistNodeTest {
         assertEquals("", dialer(reality("БС-нода", "www.microsoft.com", sub = "🔲WL | sirius")))
     }
 }
+
+// «TUN + прокси» (12.11.2026): рядом с tun — mixed на 127.0.0.1 со своим логином.
+class TunProxyTest {
+    private val n = Node("VLESS", "r", "203.0.113.10", 443, uuid = "3f1c2a4e-8b7d-4c21-9e55-0a6b7c8d9e10",
+        sni = "www.microsoft.com", pbk = "jNXHt1yRo0vDuchQlIP6Z0ZvjT3KtzVI-T4E7RoLJS0", sid = "ab12",
+        flow = "xtls-rprx-vision", security = "reality", fp = "chrome")
+
+    private fun inbounds(localProxy: Boolean, lan: Boolean = false, pass: String = "secret") =
+        org.json.JSONObject(ConfigBuilder.build(n, geoRouting = false, ipv6 = false, vpnEnabled = true,
+            dpiEnabled = false, armor = true, viaXray = false, proxyMode = false,
+            lanProxy = lan, lanUser = "zen", lanPass = if (lan) "lanpw" else "",
+            localProxy = localProxy, localUser = "zen_ab12cd", localPass = pass).toString())
+            .getJSONArray("inbounds").let { a -> (0 until a.length()).map { a.getJSONObject(it) } }
+
+    @Test fun tunOnlyHasNoLocalProxy() {
+        assertTrue(inbounds(false).none { it.optString("tag") == "mixed-in" })
+        assertTrue(inbounds(false).any { it.getString("type") == "tun" })
+    }
+
+    @Test fun tunPlusProxyListensLocallyWithAuth() {
+        val m = inbounds(true).first { it.optString("tag") == "mixed-in" }
+        assertEquals("127.0.0.1", m.getString("listen"))
+        assertEquals(Prefs.PROXY_PORT, m.getInt("listen_port"))
+        val u = m.getJSONArray("users").getJSONObject(0)
+        assertEquals("zen_ab12cd", u.getString("username"))
+        assertEquals("secret", u.getString("password"))
+        assertTrue(inbounds(true).any { it.getString("type") == "tun" })
+        java.io.File("build/zen-configs").mkdirs()
+        java.io.File("build/zen-configs/tun-proxy.json").writeText(
+            ConfigBuilder.build(n, geoRouting = false, ipv6 = false, vpnEnabled = true, dpiEnabled = false,
+                armor = true, viaXray = false, proxyMode = false,
+                localProxy = true, localUser = "zen_ab12cd", localPass = "secret").toString(2))
+    }
+
+    @Test fun lanShareWinsAndKeepsItsPassword() {
+        val m = inbounds(true, lan = true).first { it.optString("tag") == "mixed-in" }
+        assertEquals("0.0.0.0", m.getString("listen"))
+        assertEquals("lanpw", m.getJSONArray("users").getJSONObject(0).getString("password"))
+    }
+
+    @Test fun noPasswordMeansOpenLocalProxy() {
+        val m = inbounds(true, pass = "").first { it.optString("tag") == "mixed-in" }
+        assertFalse(m.has("users"))
+    }
+}

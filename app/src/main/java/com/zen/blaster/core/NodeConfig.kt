@@ -87,6 +87,8 @@ object NodeConfig {
             slowLink = NetInfo.slowMobile(ctx),
             bypassApps = if (prefs.geoRouting) prefs.splitApps() else emptySet(),
             lanProxy = prefs.lanProxy, lanUser = prefs.lanUser, lanPass = prefs.lanPass,
+            localProxy = prefs.tunnelMode == "tun_proxy", localUser = prefs.localUser,
+            localPass = if (prefs.localAuth) prefs.localPass else "",
             dohUrl = prefs.dnsUrl(), directDohUrl = prefs.preDnsUrl(),
             chainViaDpi = prefs.chainVpnViaDpi && dpiOn
         ).toString()

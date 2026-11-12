@@ -93,6 +93,9 @@ object ConfigBuilder {
         lanProxy: Boolean = false,  // пускать в прокси из локальной сети (раздача на ПК)
         lanUser: String = "",       // имя для входа в этот прокси
         lanPass: String = "",       // пароль; пусто = вход без пароля
+        localProxy: Boolean = false, // «TUN + прокси»: рядом с VPN SOCKS5/HTTP на 127.0.0.1
+        localUser: String = "",     // логин локального прокси
+        localPass: String = "",     // пароль; пусто = без пароля
         dohUrl: String = "https://1.1.1.1/dns-query", // резолвер ВНУТРИ туннеля
         // Резолвер для всего, что идёт МИМО туннеля. Отдельный, потому что
         // требования противоположные: внутри туннеля запрос зашифрован до
@@ -355,19 +358,24 @@ object ConfigBuilder {
         val inbounds = JSONArray()
         val mixed = JSONObject()
             .put("type", "mixed").put("tag", "mixed-in")
-            .put("listen", if (proxyMode && !lanProxy) "127.0.0.1" else "0.0.0.0")
+            .put("listen", if (lanProxy) "0.0.0.0" else "127.0.0.1")
             .put("listen_port", Prefs.PROXY_PORT)
         // Открытый прокси на 0.0.0.0 — это открытый ретранслятор: в общей
         // сети им воспользуется кто угодно, и наружу это будет выглядеть как
         // наш трафик. Поэтому пароль, а не «ну ладно».
-        if (lanPass.isNotEmpty())
-            mixed.put("users", JSONArray().put(
-                JSONObject().put("username", lanUser.ifEmpty { "zen" }).put("password", lanPass)))
+        // На 127.0.0.1 — свой логин (Prefs.localAuth): локальный прокси видят
+        // все приложения телефона, и без пароля любое узнает через него адрес
+        // выхода. Один вход на порт — раздача на ПК покрывает и локальный.
+        // Без своего пароля — как раньше: пароль раздачи, если он есть.
+        val (pu, pp) = if (lanProxy || localPass.isEmpty()) lanUser.ifEmpty { "zen" } to lanPass
+                       else localUser to localPass
+        if (pp.isNotEmpty())
+            mixed.put("users", JSONArray().put(JSONObject().put("username", pu).put("password", pp)))
 
         if (proxyMode) inbounds.put(mixed)
         else {
             inbounds.put(tun)
-            if (lanProxy) inbounds.put(mixed)
+            if (lanProxy || localProxy) inbounds.put(mixed)
         }
 
         // СЛУЖЕБНЫЙ ВХОД ДЛЯ САМОГО ПРИЛОЖЕНИЯ.

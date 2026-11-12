@@ -18,6 +18,10 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.ContentCopy
+import androidx.compose.material.icons.outlined.Visibility
+import androidx.compose.material.icons.outlined.VisibilityOff
+import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Hub
 import androidx.compose.material.icons.outlined.CloudSync
 import androidx.compose.material.icons.outlined.AddLink
@@ -426,6 +430,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = Prefs(this)
+        setZenTheme(prefs.themeId)
         selected.intValue = prefs.selectedServer
         selectedAwg.intValue = prefs.selectedAwg
         engine.intValue = prefs.engine
@@ -1724,6 +1729,8 @@ class MainActivity : ComponentActivity() {
             // один переключатель на обе половины, сайты и приложения.
             bypassApps = if (prefs.geoRouting) prefs.splitApps() else emptySet(),
             lanProxy = prefs.lanProxy, lanUser = prefs.lanUser, lanPass = prefs.lanPass,
+            localProxy = prefs.tunnelMode == "tun_proxy", localUser = prefs.localUser,
+            localPass = if (prefs.localAuth) prefs.localPass else "",
             dohUrl = prefs.dnsUrl(), directDohUrl = prefs.preDnsUrl(), chainViaDpi = chainOn
         ).toString()
         // Hysteria2 через Xray: заявленных скоростей Xray не берёт (у него свой
@@ -4240,38 +4247,53 @@ class MainActivity : ComponentActivity() {
 
             }
             SetGroup("СЕТЬ")
-            SetCard(Icons.Outlined.Router, "Как использовать сервер", "VPN для всего телефона или прокси") {
-            var proxy by remember { mutableStateOf(prefs.proxyMode) }
-            Row(Modifier.fillMaxWidth().padding(top = 6.dp)) {
-                listOf(false to "VPN (весь телефон)", true to "Прокси (порт)").forEach { (v, label) ->
-                    Surface(
-                        color = if (proxy == v) ZenRed.copy(alpha = 0.30f) else ZenCard,
-                        shape = RoundedCornerShape(6.dp),
-                        modifier = Modifier.weight(1f).padding(end = 6.dp).clickable {
-                            if (proxy != v) {
-                                proxy = v; prefs.proxyMode = v
-                                if (connState.intValue != 0) {
-                                    log("🔄 Смена режима — переподключаюсь…")
-                                    stopTunnel()
-                                    lifecycleScope.launch {
-                                        kotlinx.coroutines.delay(900); toggleConnect(force = true)
-                                    }
-                                }
-                            }
-                        }
-                    ) { Text(label, color = Color.White, fontSize = 13.sp,
-                        modifier = Modifier.padding(10.dp)) }
+            SetCard(Icons.Outlined.Router, "Режим туннеля", "TUN + прокси, только TUN или только прокси") {
+            // РЕЖИМ ТУННЕЛЯ — как у INCY: TUN + прокси / только TUN / только прокси.
+            var mode by remember { mutableStateOf(prefs.tunnelMode) }
+            var authOn by remember { mutableStateOf(prefs.localAuth) }
+            var creds by remember { mutableStateOf(prefs.localUser to prefs.localPass) }
+            fun reconnectIfUp() {
+                if (connState.intValue == 0) return
+                log("🔄 Режим прокси изменён — переподключаюсь…")
+                stopTunnel()
+                lifecycleScope.launch { kotlinx.coroutines.delay(900); toggleConnect(force = true) }
+            }
+            TUNNEL_MODES.forEach { (k, title, sub) ->
+                ModeOption(title, sub, mode == k) {
+                    if (mode != k) {
+                        mode = k; prefs.tunnelMode = k; useProxy.value = k == "proxy"
+                        log("🔀 Режим туннеля: $title")
+                        reconnectIfUp()
+                    }
                 }
             }
-            Text(
-                if (proxy)
-                    "Ядро слушает SOCKS5 и HTTP на 127.0.0.1:${Prefs.PROXY_PORT}. " +
-                    "Системные маршруты не трогаются, разрешение VPN не нужно — " +
-                    "прокси прописывается в приложении вручную (браузер, Termux и т.п.). " +
-                    "Остальной трафик телефона идёт напрямую."
-                else "Поднимается системный VPN: в туннель уходит весь трафик телефона.",
-                color = ZenGray, fontSize = 11.sp, modifier = Modifier.padding(top = 6.dp)
-            )
+            if (mode != "tun") {
+                HorizontalDivider(color = ZenDivider, modifier = Modifier.padding(vertical = 10.dp))
+                Text("ЛОКАЛЬНЫЙ ПРОКСИ · SOCKS5 + HTTP", color = ZenGray, fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                CopyRow("Адрес", "127.0.0.1")
+                CopyRow("Порт", "${Prefs.PROXY_PORT}")
+                ToggleRow("SOCKS5 авторизация — логин и пароль на прокси: без них любое приложение " +
+                    "на телефоне может сходить через него и узнать, что включён VPN", authOn) {
+                    authOn = it; prefs.localAuth = it; reconnectIfUp() }
+                if (authOn) {
+                    CopyRow("Логин", creds.first)
+                    CopyRow("Пароль", creds.second, secret = true)
+                    Text("↻  Сбросить логин и пароль", color = ZenCyan, fontSize = 13.sp,
+                        modifier = Modifier.clip(RoundedCornerShape(8.dp)).clickable {
+                            prefs.resetLocalCreds(); creds = prefs.localUser to prefs.localPass
+                            log("🔑 Новый логин и пароль локального прокси"); reconnectIfUp()
+                        }.padding(vertical = 8.dp))
+                }
+                Text(
+                    if (mode == "proxy")
+                        "Системный VPN не поднимается, значка ключа нет. Прокси прописывается вручную " +
+                        "в приложении (браузер, Telegram, Termux); остальной трафик телефона идёт напрямую."
+                    else "Весь телефон идёт через VPN, а приложения, которые умеют прокси (Telegram, " +
+                        "браузеры, Termux), могут ходить и через 127.0.0.1:${Prefs.PROXY_PORT} — в ту же ноду. " +
+                        "Раздача на компьютер ниже открывает тот же порт для Wi-Fi со своим паролем.",
+                    color = ZenGray, fontSize = 11.sp, modifier = Modifier.padding(top = 6.dp))
+            }
 
             // ---------- РАЗДАЧА НА КОМПЬЮТЕР ----------
             }
@@ -4677,7 +4699,8 @@ class MainActivity : ComponentActivity() {
             SetCard(Icons.Outlined.Tune, "Соединение · VLESS / Reality", "mux, нарезка, QUIC, отпечаток, стек TUN") { TuningSection() }
 
             SetGroup("ПРИЛОЖЕНИЕ")
-            SetCard(Icons.Outlined.Palette, "Внешний вид", "надпись на главной") {
+            SetCard(Icons.Outlined.Palette, "Внешний вид", "цветовая тема и надпись на главной", startOpen = false) {
+            ThemePicker()
             Text(
                 "Надпись сверху настраивается: нажмите прямо на неё. Можно сменить " +
                 "шрифт (готика не обязательна), размер или вписать своё название.",
@@ -4940,6 +4963,88 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    // Режимы туннеля — порядок как в меню INCY.
+    private val TUNNEL_MODES = listOf(
+        Triple("tun_proxy", "TUN + прокси",
+            "весь телефон через VPN и ещё SOCKS5/HTTP на 127.0.0.1:${Prefs.PROXY_PORT}"),
+        Triple("tun", "Только TUN", "весь телефон через VPN, без локального прокси"),
+        Triple("proxy", "Только прокси", "без VPN и значка ключа: только SOCKS5/HTTP, остальное напрямую"),
+    )
+
+    // Вариант выбора плиткой с кружком слева — для взаимоисключающих режимов.
+    @Composable
+    private fun ModeOption(title: String, sub: String, on: Boolean, onClick: () -> Unit) {
+        Row(Modifier.fillMaxWidth().padding(vertical = 3.dp).clip(RoundedCornerShape(12.dp))
+            .background(if (on) ZenCyan.copy(alpha = 0.12f) else Color.Transparent)
+            .border(1.dp, if (on) ZenCyan else ZenDivider, RoundedCornerShape(12.dp))
+            .clickable { onClick() }.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(18.dp).clip(CircleShape).border(2.dp, if (on) ZenCyan else ZenGray, CircleShape),
+                contentAlignment = Alignment.Center) {
+                if (on) Box(Modifier.size(9.dp).clip(CircleShape).background(ZenCyan))
+            }
+            Column(Modifier.weight(1f).padding(start = 12.dp)) {
+                Text(title, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                Text(sub, color = ZenGray, fontSize = 12.sp)
+            }
+        }
+    }
+
+    // Строка «название — значение» с кнопкой копирования (логин, пароль, порт).
+    // Пароль скрыт точками, глаз — показать.
+    @Composable
+    private fun CopyRow(label: String, value: String, secret: Boolean = false) {
+        var show by remember { mutableStateOf(!secret) }
+        Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(label, color = ZenGray, fontSize = 13.sp, modifier = Modifier.width(72.dp))
+            Text(if (show) value else "•".repeat(12), color = Color.White, fontSize = 14.sp,
+                fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace, modifier = Modifier.weight(1f))
+            if (secret) Icon(if (show) Icons.Outlined.VisibilityOff else Icons.Outlined.Visibility, null,
+                tint = ZenGray, modifier = Modifier.size(34.dp).clip(CircleShape).clickable { show = !show }.padding(7.dp))
+            Icon(Icons.Outlined.ContentCopy, null, tint = ZenCyan,
+                modifier = Modifier.size(34.dp).clip(CircleShape).clickable {
+                    (getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager)
+                        .setPrimaryClip(android.content.ClipData.newPlainText("zen-$label", value))
+                    toast("$label скопирован")
+                }.padding(7.dp))
+        }
+    }
+
+    // ЦВЕТОВЫЕ ТЕМЫ — плитками, как «Оформление» у INCY: название, пара слов,
+    // кружки цветов и отметка у выбранной. Применяется сразу, без перезапуска.
+    @Composable
+    private fun ThemePicker() {
+        Text("ЦВЕТОВАЯ ТЕМА", color = ZenGray, fontSize = 11.sp, fontWeight = FontWeight.Bold,
+            letterSpacing = 1.sp, modifier = Modifier.padding(bottom = 6.dp))
+        val cur = zenPalette.id
+        ZEN_THEMES.chunked(2).forEach { pair ->
+            Row(Modifier.fillMaxWidth()) {
+                pair.forEach { t ->
+                    val on = t.id == cur
+                    Column(Modifier.weight(1f).padding(3.dp).clip(RoundedCornerShape(14.dp))
+                        .background(t.card).border(if (on) 2.dp else 1.dp, if (on) t.accent else t.divider,
+                            RoundedCornerShape(14.dp))
+                        .clickable { prefs.themeId = t.id; setZenTheme(t.id); log("🎨 Тема: ${t.name}") }
+                        .padding(10.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(t.name, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.weight(1f))
+                            if (on) Icon(Icons.Outlined.Check, null, tint = t.accent, modifier = Modifier.size(18.dp))
+                        }
+                        Text(t.about, color = t.gray, fontSize = 11.sp, maxLines = 2, minLines = 2)
+                        Row(Modifier.padding(top = 8.dp)) {
+                            listOf(t.bg, t.accent, t.accent2).forEach { c ->
+                                Box(Modifier.padding(end = 6.dp).size(16.dp).clip(CircleShape).background(c)
+                                    .border(1.dp, t.divider, CircleShape))
+                            }
+                        }
+                    }
+                }
+                if (pair.size == 1) Spacer(Modifier.weight(1f))
+            }
+        }
+        Spacer(Modifier.height(10.dp))
     }
 
     // Переключатель строкой, как у INCY: сверху название, под ним серым —
@@ -5242,7 +5347,7 @@ class MainActivity : ComponentActivity() {
         }
         // Быстрые команды — нажал, и она выполнилась.
         Row(Modifier.fillMaxWidth().padding(top = 6.dp).horizontalScroll(rememberScrollState())) {
-            listOf("status", "helpzen", "ping", "diag", "flow", "net", "wl", "get", "tail").forEach { c ->
+            listOf("status", "helpzen", "ping", "diag", "flow", "net", "wl", "proxy", "get", "tail").forEach { c ->
                 LogChip(c, false) { runCli(c) }
             }
         }
@@ -5345,10 +5450,23 @@ class MainActivity : ComponentActivity() {
                 "    killswitch — без туннеля интернет закрыт совсем\n" +
                 "    armor — броня от распознавания (отпечаток, нарезка)\n" +
                 "    fp light|ios|chrome|firefox — под какой браузер притворяться\n" +
-                "    stack auto|gvisor|system|mixed — как телефон отдаёт трафик в туннель",
+                "    stack auto|gvisor|system|mixed — как телефон отдаёт трафик в туннель\n" +
+                "    mode tun|tun+proxy|proxy — только VPN, VPN и локальный прокси, или только прокси\n" +
+                "    auth on|off — логин и пароль на локальном прокси\n" +
+                "    theme neon|forest|lavender|ocean|peach|sakura|moss|graphite — цветовая тема (сразу)",
             "Покрутить настройки без лазанья по меню. Применится при следующем подключении " +
                 "(или сразу — командой reconnect).",
             "set mux off   ·   set fp ios   ·   set stack gvisor"),
+        CliCmd("proxy", "прокси", "локальный прокси",
+            "Показывает режим туннеля и данные локального прокси: адрес, порт, логин. " +
+                "proxy show — показать и пароль.",
+            "Прописать прокси в Telegram или браузере: всё нужное — в одном месте, " +
+                "логин и пароль можно скопировать в настройках (Режим туннеля).",
+            "proxy   ·   proxy show"),
+        CliCmd("themes", "темы", "список цветовых тем",
+            "Показывает все темы: короткое имя для set theme и пару слов о цветах. Галочка — текущая.",
+            "Выбрать тему, не листая настройки: themes, потом set theme lavender.",
+            "themes"),
         CliCmd("tail", "", "последние строки журнала",
             "Показывает здесь последние строки живого журнала (по умолчанию 20).",
             "Посмотреть, что ответили diag, flow или net, не уходя из терминала.",
@@ -5508,11 +5626,26 @@ class MainActivity : ComponentActivity() {
                 out("Zen Nitro ${packageManager.getPackageInfo(packageName, 0).versionName}")
                 out("sing-box ${io.nekohasekai.libbox.Libbox.version()} · Xray ${XrayEngine.version(this, builtin = false)}")
             }
+            "proxy", "прокси" -> {
+                val m = prefs.tunnelMode
+                out("режим: " + TUNNEL_MODES.first { it.first == m }.second)
+                if (m == "tun") out("локального прокси нет — включить: set mode tun+proxy")
+                else {
+                    out("адрес 127.0.0.1 · порт ${Prefs.PROXY_PORT} · SOCKS5 и HTTP")
+                    if (prefs.localAuth) out("логин ${prefs.localUser} · пароль " +
+                        (if (arg == "show") prefs.localPass else "скрыт (proxy show — показать)"))
+                    else out("без пароля — включить: set auth on")
+                }
+            }
+            "themes", "темы" -> ZEN_THEMES.forEach {
+                out("${it.id.padEnd(9)} ${it.name} — ${it.about}" + (if (it.id == prefs.themeId) "  ✓" else ""))
+            }
             "get" -> {
                 fun f(b: Boolean) = if (b) "on" else "off"
                 out("mux ${f(prefs.muxOn)} · frag ${f(prefs.fragOn)} · quic ${f(prefs.blockQuic)} · armor ${f(prefs.armor)}")
                 out("fp ${prefs.tlsFpChoice} · stack ${prefs.tunStack} · autoswitch ${f(prefs.autoSwitchNode)} · " +
                     "killswitch ${f(prefs.killSwitch)}")
+                out("mode ${prefs.tunnelMode} · auth ${f(prefs.localAuth)} · theme ${prefs.themeId}")
             }
             "set" -> {
                 val k = parts.getOrNull(1)?.lowercase().orEmpty()
@@ -5523,6 +5656,13 @@ class MainActivity : ComponentActivity() {
                     "frag" -> b?.let { prefs.fragOn = it }
                     "quic" -> b?.let { prefs.blockQuic = it }
                     "autoswitch" -> b?.let { prefs.autoSwitchNode = it }
+                    "mode" -> when (v.lowercase()) {
+                        "tun" -> "tun"; "tun+proxy", "tun_proxy", "tunproxy", "both" -> "tun_proxy"
+                        "proxy" -> "proxy"; else -> null
+                    }?.let { prefs.tunnelMode = it; useProxy.value = it == "proxy" }
+                    "auth" -> b?.let { prefs.localAuth = it }
+                    "theme" -> ZEN_THEMES.firstOrNull { it.id == v.lowercase() }
+                        ?.let { prefs.themeId = it.id; setZenTheme(it.id) }
                     "killswitch" -> b?.let { prefs.killSwitch = it }
                     "armor" -> b?.let { prefs.armor = it }
                     "fp" -> v.lowercase().takeIf { it in setOf("light", "ios", "chrome", "firefox") }

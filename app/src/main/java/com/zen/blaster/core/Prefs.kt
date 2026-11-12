@@ -158,6 +158,53 @@ class Prefs(context: Context) {
         get() = sp.getBoolean("proxyMode", false)
         set(v) = sp.edit().putBoolean("proxyMode", v).apply()
 
+    // РЕЖИМ ТУННЕЛЯ — как у INCY: «tun_proxy» (VPN и рядом локальный
+    // SOCKS5/HTTP 127.0.0.1:PROXY_PORT для приложений, которые умеют прокси),
+    // «tun» (только VPN), «proxy» (только прокси, без VPN = proxyMode).
+    var tunnelMode: String
+        get() = if (proxyMode) "proxy" else sp.getString("tunnelMode", "tun").let {
+            if (it == "tun_proxy") it else "tun" }
+        set(v) {
+            proxyMode = v == "proxy"
+            sp.edit().putString("tunnelMode", v).apply()
+        }
+
+    // ЛОГИН И ПАРОЛЬ ЛОКАЛЬНОГО ПРОКСИ.
+    //
+    // Открытый 127.0.0.1 видят ВСЕ приложения телефона: любое может сходить
+    // через него и узнать адрес выхода — так приложения и вычисляют VPN.
+    // INCY поэтому держит SOCKS5 с паролем по умолчанию; мы — тоже. Только
+    // у тех, кто уже сидел в «Только прокси» без пароля, по умолчанию выкл.:
+    // иначе их браузеры и Telegram после обновления молча отвалились бы.
+    var localAuth: Boolean
+        get() {
+            // Умолчание фиксируем при первом чтении: иначе смена режима потом
+            // молча переворачивала бы и пароль.
+            if (!sp.contains("localAuth")) sp.edit().putBoolean("localAuth", !proxyMode).apply()
+            return sp.getBoolean("localAuth", true)
+        }
+        set(v) = sp.edit().putBoolean("localAuth", v).apply()
+
+    val localUser: String
+        get() = sp.getString("localUser", null) ?: ("zen_" + (1..6).map { "0123456789abcdef".random() }
+            .joinToString("")).also { sp.edit().putString("localUser", it).apply() }
+
+    val localPass: String
+        get() = sp.getString("localPass", null) ?: newSecret().also { sp.edit().putString("localPass", it).apply() }
+
+    fun resetLocalCreds() { sp.edit().remove("localUser").remove("localPass").apply(); localUser; localPass }
+
+    private fun newSecret(): String {
+        val abc = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+        val r = java.security.SecureRandom()
+        return (1..20).map { abc[r.nextInt(abc.length)] }.joinToString("")
+    }
+
+    // Цветовая тема (ui/Theme.kt, ZEN_THEMES).
+    var themeId: String
+        get() = sp.getString("themeId", "neon") ?: "neon"
+        set(v) = sp.edit().putString("themeId", v).apply()
+
     companion object {
         const val PROXY_PORT = 2080
 
