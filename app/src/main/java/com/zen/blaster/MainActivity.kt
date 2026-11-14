@@ -2530,7 +2530,9 @@ class MainActivity : ComponentActivity() {
             containerColor = ZenCard,
             title = { Text("Режимы", color = Color.White, fontSize = 17.sp) },
             text = {
-                Column {
+                // С прокруткой: на Xiaomi 14.11.2026 третий режим уходил за низ окна,
+                // и выбрать «Только прокси» отсюда было нельзя.
+                Column(Modifier.verticalScroll(rememberScrollState())) {
                     Text("ЯДРО ТУННЕЛЯ", color = ZenRed, fontSize = 12.sp,
                         fontWeight = FontWeight.Bold)
                     Row(Modifier.fillMaxWidth().padding(top = 6.dp)) {
@@ -2550,35 +2552,24 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                     Text(
-                        "Авто смотрит на транспорт ноды: XHTTP и kcp умеет только Xray, " +
-                        "остальное берёт sing-box. Ручной выбор нужен там, где нода " +
-                        "поднимается лишь одним из них: TLS-приветствие они собирают " +
-                        "по-разному. В ручном режиме откат на второе ядро не срабатывает.",
+                        "Авто: XHTTP и kcp — через Xray, остальное — sing-box. Ручной — " +
+                        "если нода встаёт лишь в одном ядре (откат на второе тогда выключен).",
                         color = ZenGray, fontSize = 11.sp, modifier = Modifier.padding(top = 6.dp)
                     )
 
-                    Spacer(Modifier.height(14.dp))
+                    Spacer(Modifier.height(12.dp))
                     Text("КАК ПОДНИМАТЬ НОДУ", color = ZenRed, fontSize = 12.sp,
                         fontWeight = FontWeight.Bold)
                     // Столбиком, как в настройках: в три кнопки в ряд «TUN + прокси» и
                     // «Только прокси» не влезали — на Xiaomi 14.11.2026 было «Только» × 2.
                     Column(Modifier.fillMaxWidth().padding(top = 4.dp)) {
-                        TUNNEL_MODES.forEach { (v, title, sub) ->
-                            ModeOption(title, sub, tunMode.value == v) { switchTunnelMode(v) }
+                        listOf("tun_proxy" to "TUN + прокси" to "VPN и SOCKS5/HTTP на 127.0.0.1:${Prefs.PROXY_PORT}",
+                            "tun" to "Только TUN" to "весь телефон через VPN",
+                            "proxy" to "Только прокси" to "без VPN: только SOCKS5/HTTP").forEach { (p, sub) ->
+                            ModeOption(p.second, sub, tunMode.value == p.first, compact = true) {
+                                switchTunnelMode(p.first) }
                         }
                     }
-                    Text(
-                        when (tunMode.value) {
-                            "proxy" -> "Ядро слушает SOCKS5 и HTTP на 127.0.0.1:${Prefs.PROXY_PORT}. " +
-                                "Маршруты системы не трогаются, разрешение VPN не нужно — " +
-                                "через ноду идёт только тот, кто этот порт себе прописал."
-                            "tun_proxy" -> "Системный VPN для всего телефона и рядом SOCKS5/HTTP на " +
-                                "127.0.0.1:${Prefs.PROXY_PORT} для приложений с прокси" +
-                                (if (prefs.localAuth) " — с логином и паролем (Настройки → Режим туннеля)." else ".")
-                            else -> "Системный VPN: в туннель уходит весь трафик телефона."
-                        },
-                        color = ZenGray, fontSize = 11.sp, modifier = Modifier.padding(top = 6.dp)
-                    )
                 }
             },
             confirmButton = {
@@ -4982,18 +4973,20 @@ class MainActivity : ComponentActivity() {
 
     // Вариант выбора плиткой с кружком слева — для взаимоисключающих режимов.
     @Composable
-    private fun ModeOption(title: String, sub: String, on: Boolean, onClick: () -> Unit) {
-        Row(Modifier.fillMaxWidth().padding(vertical = 3.dp).clip(RoundedCornerShape(12.dp))
+    // compact — для окна «Режимы»: меньше отступы и мельче пояснение, чтобы
+    // всё влезало в окно без прокрутки.
+    private fun ModeOption(title: String, sub: String, on: Boolean, compact: Boolean = false, onClick: () -> Unit) {
+        Row(Modifier.fillMaxWidth().padding(vertical = if (compact) 2.dp else 3.dp).clip(RoundedCornerShape(12.dp))
             .background(if (on) ZenCyan.copy(alpha = 0.12f) else Color.Transparent)
             .border(1.dp, if (on) ZenCyan else ZenDivider, RoundedCornerShape(12.dp))
-            .clickable { onClick() }.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+            .clickable { onClick() }.padding(if (compact) 9.dp else 12.dp), verticalAlignment = Alignment.CenterVertically) {
             Box(Modifier.size(18.dp).clip(CircleShape).border(2.dp, if (on) ZenCyan else ZenGray, CircleShape),
                 contentAlignment = Alignment.Center) {
                 if (on) Box(Modifier.size(9.dp).clip(CircleShape).background(ZenCyan))
             }
             Column(Modifier.weight(1f).padding(start = 12.dp)) {
-                Text(title, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-                Text(sub, color = ZenGray, fontSize = 12.sp)
+                Text(title, color = Color.White, fontSize = if (compact) 13.sp else 14.sp, fontWeight = FontWeight.SemiBold)
+                Text(sub, color = ZenGray, fontSize = if (compact) 11.sp else 12.sp)
             }
         }
     }
