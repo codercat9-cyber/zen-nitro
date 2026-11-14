@@ -2560,21 +2560,11 @@ class MainActivity : ComponentActivity() {
                     Spacer(Modifier.height(14.dp))
                     Text("КАК ПОДНИМАТЬ НОДУ", color = ZenRed, fontSize = 12.sp,
                         fontWeight = FontWeight.Bold)
-                    Row(Modifier.fillMaxWidth().padding(top = 6.dp)) {
-                        listOf("tun_proxy" to "TUN + прокси", "tun" to "Только TUN", "proxy" to "Только прокси")
-                                .forEach { (v, label) ->
-                            val on = tunMode.value == v
-                            Surface(
-                                color = if (on) ZenRed.copy(alpha = 0.26f) else ZenBg,
-                                shape = RoundedCornerShape(8.dp),
-                                modifier = Modifier.weight(1f).padding(end = 5.dp)
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .clickable { switchTunnelMode(v) }
-                            ) {
-                                Text(label, color = if (on) Color.White else ZenGray, fontSize = 12.sp,
-                                    maxLines = 1, textAlign = TextAlign.Center,
-                                    modifier = Modifier.fillMaxWidth().padding(vertical = 9.dp))
-                            }
+                    // Столбиком, как в настройках: в три кнопки в ряд «TUN + прокси» и
+                    // «Только прокси» не влезали — на Xiaomi 14.11.2026 было «Только» × 2.
+                    Column(Modifier.fillMaxWidth().padding(top = 4.dp)) {
+                        TUNNEL_MODES.forEach { (v, title, sub) ->
+                            ModeOption(title, sub, tunMode.value == v) { switchTunnelMode(v) }
                         }
                     }
                     Text(
